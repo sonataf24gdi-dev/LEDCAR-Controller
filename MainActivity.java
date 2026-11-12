@@ -19,12 +19,14 @@ public class MainActivity extends Activity {
     private static final byte[] BRIGHT_MAX=hex("7BFF01206402FFFFBF"), BRIGHT_MIN=hex("7BFF01000102FFFFBF");
     private final Handler handler=new Handler(Looper.getMainLooper());
     private BluetoothAdapter adapter; private BluetoothLeScanner scanner; private BluetoothGatt gatt;
-    private BluetoothGattCharacteristic characteristic; private TextView status, colorLabel;
+    private BluetoothGattCharacteristic characteristic; private TextView status, colorLabel, brightnessLabel; private TextView powerButton; private LinearLayout mainPage, settingsPage; private boolean powerOn=true; private int brightness=100;
     private SeekBar red,green,blue; private ColorWheel wheel;
+    private LinearLayout presetRow; private final int[] presets=new int[6]; private final boolean[] presetSaved=new boolean[6];
     private boolean scanning=false, active=false, connecting=false, connected=false, updating=false, choosing=false;
     private final LinkedHashMap<String,BluetoothDevice> candidates=new LinkedHashMap<>();
     private String savedAddress=""; private int r=255,g=0,b=0;
     private final Runnable sendPending=()->{if(connected) send(rgbPacket(r,g,b));};
+    private final Runnable sendBrightness=()->{if(connected)send(brightnessPacket(brightness));};
     private final Runnable retry=()->{if(active&&!connected&&!connecting) scan();};
     private final Runnable scanTimeout=()->{stopScan(); if(choosing){choosing=false;showCandidates();}else if(active&&!connected&&!connecting) scheduleRetry();};
 
@@ -83,32 +85,97 @@ public class MainActivity extends Activity {
     };
     @Override public void onCreate(Bundle state){super.onCreate(state);
         savedAddress=getPreferences(MODE_PRIVATE).getString("last_device","");
+        for(int i=0;i<6;i++){presetSaved[i]=getPreferences(MODE_PRIVATE).contains("preset_"+i);presets[i]=getPreferences(MODE_PRIVATE).getInt("preset_"+i,Color.WHITE);}
         BluetoothManager manager=(BluetoothManager)getSystemService(BLUETOOTH_SERVICE);adapter=manager.getAdapter();
-        ScrollView scroll=new ScrollView(this);LinearLayout root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);
-        int pad=dp(18);root.setPadding(pad,pad,pad,pad);scroll.addView(root);setContentView(scroll);
-        TextView title=new TextView(this);title.setText("엠비언트 설정");title.setTextSize(26);root.addView(title);
-        status=new TextView(this);status.setText("자동 연결 준비 중");status.setPadding(0,dp(12),0,dp(12));root.addView(status);
-        button(root,"차량 연결",()->{if(savedAddress.isEmpty())startDevicePicker();else{disconnect(false);scan();}});
-        button(root,"다른 차량 선택",()->startDevicePicker());
-        section(root,"전원");LinearLayout power=new LinearLayout(this);power.setOrientation(LinearLayout.HORIZONTAL);root.addView(power);
-        button(power,"켜기",()->send(ON));button(power,"끄기",()->send(OFF));
-        section(root,"색상표 · 터치하거나 드래그하세요");
-        wheel=new ColorWheel(this);root.addView(wheel,new LinearLayout.LayoutParams(-1,dp(290)));
+        buildPages();
+        if(hasPermissions())startAuto();else requestNeededPermissions();
+    }
+    private void buildPages(){
+        mainPage=new LinearLayout(this);mainPage.setOrientation(LinearLayout.VERTICAL);mainPage.setPadding(dp(18),dp(18),dp(18),dp(18));
+        settingsPage=new LinearLayout(this);settingsPage.setOrientation(LinearLayout.VERTICAL);settingsPage.setPadding(dp(18),dp(18),dp(18),dp(18));
+        LinearLayout header=new LinearLayout(this);header.setGravity(Gravity.CENTER_VERTICAL);mainPage.addView(header);
+        TextView title=new TextView(this);title.setText("엠비언트 설정");title.setTextSize(26);header.addView(title,new LinearLayout.LayoutParams(0,dp(60),1));
+        powerButton=new TextView(this);powerButton.setText("⏻");powerButton.setTextSize(37);powerButton.setGravity(Gravity.CENTER);
+        TextView settingsIcon=new TextView(this);settingsIcon.setText("⚙");settingsIcon.setTextSize(27);settingsIcon.setGravity(Gravity.CENTER);
+        settingsIcon.setContentDescription("차량 연결 설정");header.addView(settingsIcon,new LinearLayout.LayoutParams(dp(48),dp(60)));
+        settingsIcon.setOnClickListener(v->openSettings());
+        header.addView(powerButton,new LinearLayout.LayoutParams(dp(52),dp(60)));powerButton.setContentDescription("전원 켜기 또는 끄기");
+        powerButton.setOnClickListener(v->{powerOn=!powerOn;refreshPower();send(powerOn?ON:OFF);});refreshPower();
+        status=new TextView(this);status.setText("자동 연결 준비 중");status.setPadding(0,dp(10),0,dp(10));mainPage.addView(status);
+        section(mainPage,"색상표 · 터치하거나 드래그하세요");
+        wheel=new ColorWheel(this);mainPage.addView(wheel,new LinearLayout.LayoutParams(-1,dp(290)));
         wheel.setOnColorChange((nr,ng,nb)->setColor(nr,ng,nb,true));
-        colorLabel=new TextView(this);colorLabel.setTextSize(18);colorLabel.setPadding(0,dp(8),0,dp(8));root.addView(colorLabel);
-        section(root,"RGB 미세 조절 · 실시간 적용");
-        red=seek(root,"R",255);green=seek(root,"G",0);blue=seek(root,"B",0);
-        SeekBar.OnSeekBarChangeListener listener=new SeekBar.OnSeekBarChangeListener(){
-            @Override public void onProgressChanged(SeekBar s,int progress,boolean user){if(user&&!updating)setColor(red.getProgress(),green.getProgress(),blue.getProgress(),false);}
+        colorLabel=new TextView(this);colorLabel.setTextSize(18);colorLabel.setPadding(0,dp(8),0,dp(8));mainPage.addView(colorLabel);
+        section(mainPage,"색상 프리셋");
+        TextView presetHelp=new TextView(this);presetHelp.setText("짧게 누르면 적용 · 길게 누르면 현재 색상 저장");presetHelp.setTextSize(13);mainPage.addView(presetHelp);
+        presetRow=new LinearLayout(this);presetRow.setOrientation(LinearLayout.HORIZONTAL);presetRow.setPadding(0,dp(8),0,0);mainPage.addView(presetRow);refreshPresets();
+        section(mainPage,"RGB");red=seek(mainPage,"R",255);green=seek(mainPage,"G",0);blue=seek(mainPage,"B",0);
+        SeekBar.OnSeekBarChangeListener rgbListener=new SeekBar.OnSeekBarChangeListener(){
+            @Override public void onProgressChanged(SeekBar s,int value,boolean user){if(user&&!updating)setColor(red.getProgress(),green.getProgress(),blue.getProgress(),false);}
             @Override public void onStartTrackingTouch(SeekBar s){}
             @Override public void onStopTrackingTouch(SeekBar s){queueColor();}
         };
-        red.setOnSeekBarChangeListener(listener);green.setOnSeekBarChangeListener(listener);blue.setOnSeekBarChangeListener(listener);
-        section(root,"밝기 · 검증된 단계");button(root,"최대 밝기",()->send(BRIGHT_MAX));button(root,"최소 밝기",()->send(BRIGHT_MIN));
-        TextView note=new TextView(this);note.setText("선택한 차량은 이름이 바뀌어도 주소로 자동 연결합니다. 새 차량은 목록에서 선택하세요.");note.setPadding(0,dp(14),0,0);root.addView(note);
-        setColor(255,0,0,false);
-        if(hasPermissions())startAuto();else requestNeededPermissions();
+        red.setOnSeekBarChangeListener(rgbListener);green.setOnSeekBarChangeListener(rgbListener);blue.setOnSeekBarChangeListener(rgbListener);
+        section(mainPage,"밝기 조절");
+        brightnessLabel=new TextView(this);mainPage.addView(brightnessLabel);
+        SeekBar brightBar=new SeekBar(this);brightBar.setMax(99);brightBar.setProgress(99);mainPage.addView(brightBar);
+        brightnessLabel.setText("100%");
+        brightBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener(){
+            @Override public void onProgressChanged(SeekBar bar,int progress,boolean user){if(!user)return;
+                brightness=progress+1;brightnessLabel.setText(brightness+"%");handler.removeCallbacks(sendBrightness);handler.postDelayed(sendBrightness,100);
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar){}
+            @Override public void onStopTrackingTouch(SeekBar bar){handler.removeCallbacks(sendBrightness);handler.post(sendBrightness);}
+        });
+        setColor(255,0,0,false);showPage(mainPage);
+        TextView settingsTitle=new TextView(this);settingsTitle.setText("차량 연결 설정");settingsTitle.setTextSize(25);settingsPage.addView(settingsTitle);
+        TextView info=new TextView(this);info.setText("이전에 선택한 차량은 앱 실행 시 자동 연결합니다. 기기 이름이 바뀌어도 저장된 주소로 인식합니다.");
+        info.setPadding(0,dp(16),0,dp(16));settingsPage.addView(info);
+        button(settingsPage,"차량 연결",()->{if(savedAddress.isEmpty())startDevicePicker();else{disconnect(false);scan();}});
+        button(settingsPage,"다른 차량 선택",()->startDevicePicker());
+        button(settingsPage,"←  메인 화면",()->showPage(mainPage));
     }
+    private void refreshPresets(){
+        if(presetRow==null)return;
+        presetRow.removeAllViews();
+        for(int i=0;i<presets.length;i++){
+            final int index=i;
+            TextView swatch=new TextView(this);
+            swatch.setText(presetSaved[i]?"●":"＋");swatch.setTextSize(25);
+            swatch.setGravity(Gravity.CENTER);
+            swatch.setTextColor(presetSaved[i]?presets[i]:Color.GRAY);
+            swatch.setContentDescription("프리셋 "+(i+1)+(presetSaved[i]?" · 누르면 적용, 길게 누르면 저장":" · 길게 누르면 저장"));
+            LinearLayout.LayoutParams params=new LinearLayout.LayoutParams(0,dp(54),1);
+            params.setMargins(dp(2),0,dp(2),0);
+            presetRow.addView(swatch,params);
+            swatch.setOnClickListener(v->{
+                if(presetSaved[index]){
+                    int color=presets[index];setColor(Color.red(color),Color.green(color),Color.blue(color),false);
+                    Toast.makeText(this,"프리셋 "+(index+1)+" 적용",Toast.LENGTH_SHORT).show();
+                }else{
+                    Toast.makeText(this,"길게 눌러 현재 색상을 저장하세요",Toast.LENGTH_SHORT).show();
+                }
+            });
+            swatch.setOnLongClickListener(v->{
+                int color=Color.rgb(r,g,b);
+                new android.app.AlertDialog.Builder(this)
+                    .setTitle("프리셋 "+(index+1)+" 저장")
+                    .setMessage(String.format(Locale.US,"현재 색상 #%06X을 저장할까요?",color&0xFFFFFF))
+                    .setPositiveButton("저장",(dialog,which)->{
+                        presets[index]=color;presetSaved[index]=true;
+                        getPreferences(MODE_PRIVATE).edit().putInt("preset_"+index,color).apply();
+                        refreshPresets();
+                        Toast.makeText(this,"색상 저장 완료",Toast.LENGTH_SHORT).show();
+                    })
+                    .setNegativeButton("취소",null).show();
+                return true;
+            });
+        }
+    }
+    private void refreshPower(){if(powerButton!=null){powerButton.setTextColor(powerOn?Color.rgb(0,165,130):Color.GRAY);powerButton.setContentDescription(powerOn?"전원 끄기":"전원 켜기");}}
+    private void openSettings(){showPage(settingsPage);}
+    private void showPage(LinearLayout page){ScrollView scroll=new ScrollView(this);if(page.getParent()!=null)((android.view.ViewGroup)page.getParent()).removeView(page);scroll.addView(page);setContentView(scroll);}
+    private static byte[] brightnessPacket(int value){int v=Math.max(1,Math.min(100,value));return new byte[]{0x7B,(byte)0xFF,0x01,(byte)(v==1?0x00:0x20),(byte)v,0x02,(byte)0xFF,(byte)0xFF,(byte)0xBF};}
     private int dp(int n){return (int)(n*getResources().getDisplayMetrics().density+0.5f);}
     private void section(LinearLayout root,String text){TextView t=new TextView(this);t.setText(text);t.setTextSize(19);t.setPadding(0,dp(18),0,dp(7));root.addView(t);}
     private void button(LinearLayout root,String text,Runnable action){Button b=new Button(this);b.setText(text);root.addView(b,root.getOrientation()==LinearLayout.HORIZONTAL?new LinearLayout.LayoutParams(0,dp(50),1):new LinearLayout.LayoutParams(-1,dp(50)));b.setOnClickListener(v->action.run());}
@@ -178,7 +245,7 @@ public class MainActivity extends Activity {
     }
     private void lost(BluetoothGatt current){if(current==gatt){gatt=null;characteristic=null;connecting=false;connected=false;
             try{current.close();}catch(Exception ignored){}show("연결 끊김 · 재연결 대기");scheduleRetry();}}
-    private void disconnect(boolean stopAuto){if(stopAuto)active=false;stopScan();handler.removeCallbacks(retry);handler.removeCallbacks(sendPending);
+    private void disconnect(boolean stopAuto){if(stopAuto)active=false;stopScan();handler.removeCallbacks(retry);handler.removeCallbacks(sendPending);handler.removeCallbacks(sendBrightness);
         BluetoothGatt old=gatt;gatt=null;characteristic=null;connecting=false;connected=false;
         if(old!=null){try{old.disconnect();old.close();}catch(Exception ignored){}}
     }
@@ -190,6 +257,7 @@ public class MainActivity extends Activity {
     }
     private void show(String text){runOnUiThread(()->{if(status!=null)status.setText(text);});}
     private static byte[] hex(String value){byte[] out=new byte[value.length()/2];for(int i=0;i<out.length;i++)out[i]=(byte)Integer.parseInt(value.substring(i*2,i*2+2),16);return out;}
+    @Override public void onBackPressed(){if(settingsPage!=null && settingsPage.getParent()!=null){showPage(mainPage);}else{super.onBackPressed();}}
     @Override protected void onDestroy(){active=false;disconnect(true);super.onDestroy();}
 
     private static class ColorWheel extends View {
