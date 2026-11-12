@@ -12,15 +12,18 @@ import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Typeface;
-import android.graphics.drawable.GradientDrawable;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -33,545 +36,226 @@ import java.util.Locale;
 import java.util.UUID;
 
 public class MainActivity extends Activity {
-    private static final String DEVICE_ADDRESS = "25:11:07:B0:04:7B";
-    private static final UUID SERVICE_UUID = UUID.fromString("0000FFE0-0000-1000-8000-00805F9B34FB");
-    private static final UUID WRITE_UUID = UUID.fromString("0000FFE1-0000-1000-8000-00805F9B34FB");
 
-    private static final byte[] SEQUENTIAL = hex("7B FF 03 51 FF FF FF FF BF");
-    private static final byte[] RAINBOW = hex("7B FF 03 01 FF FF FF FF BF");
-    private static final byte[] POWER_ON = hex("7B FF 04 07 FF FF FF FF BF");
-    private static final byte[] POWER_OFF = hex("7B FF 04 06 FF FF FF FF BF");
+    private static final String ADDRESS = "25:11:07:B0:04:7B";
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
-    private BluetoothGatt gatt;
-    private BluetoothGattCharacteristic writeCharacteristic;
+    private static final UUID SERVICE = UUID.fromString(
+        "0000FFE0-0000-1000-8000-00805F9B34FB"
+    );
+
+    private static final UUID WRITE = UUID.fromString(
+        "0000FFE1-0000-1000-8000-00805F9B34FB"
+    );
+
+    private static final byte[] POWER_ON =
+        hex("7B FF 04 07 FF FF FF FF BF");
+
+    private static final byte[] POWER_OFF =
+        hex("7B FF 04 06 FF FF FF FF BF");
+
+    private static final byte[] SEQUENTIAL =
+        hex("7B FF 03 51 FF FF FF FF BF");
+
+    private static final byte[] RAINBOW =
+        hex("7B FF 03 01 FF FF FF FF BF");
+
+    private final Handler handler =
+        new Handler(Looper.getMainLooper());
+
+    private final ArrayDeque<byte[]> outbound =
+        new ArrayDeque<>();
+
     private BluetoothAdapter adapter;
-    private boolean connecting = false, connected = false, userDisconnect = false;
-    private final ArrayDeque<byte[]> queue = new ArrayDeque<>();
-    private boolean draining = false;
+    private BluetoothGatt gatt;
+    private BluetoothGattCharacteristic characteristic;
 
-    private TextView status, modeLabel, speedLabel, brightnessLabel, rgbLabel;
+    private boolean connected = false;
+    private boolean connecting = false;
+    private boolean foreground = false;
+    private boolean power = true;
+    private boolean sending = false;
+    private boolean lightTheme = false;
+
+    private int tab = 0;
+    private int mode = 0;
+    private int brightness = 100;
+    private int speed = 50;
+    private int color = Color.RED;
+
+    private int themeBg = 0xFF101116;
+    private int themePanel = 0xFF202127;
+    private int themeText = Color.WHITE;
+    private int themeMuted = 0xFFB8BAC5;
+
+    private long lastConnectAttempt = 0;
+
+    private LinearLayout root;
     private LinearLayout content;
+    private TextView status;
+    private SharedPreferences prefs;
 
-    private int currentMode = 0;
-    private int speed = 50, brightness = 100;
-    private int red = 255, green = 255, blue = 255;
-    private int accent = Color.rgb(69, 164, 255);
-
-    private final Runnable reconnect = this::connect;
-
-    private final Runnable drainRunnable = new Runnable() {
-        @Override public void run() {
-            if (!connected || writeCharacteristic == null || gatt == null) {
-                queue.clear();
-                draining = false;
-                return;
-            }
-
-            byte[] next = queue.poll();
-            if (next == null) {
-                draining = false;
-                return;
-            }
-
-            try {
-                if (Build.VERSION.SDK_INT >= 33) {
-                    gatt.writeCharacteristic(
-                        writeCharacteristic,
-                        next,
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    );
-                } else {
-                    writeCharacteristic.setWriteType(
-                        BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    );
-                    writeCharacteristic.setValue(next);
-                    gatt.writeCharacteristic(writeCharacteristic);
-                }
-            } catch (Exception ignored) {}
-
-            handler.postDelayed(this, 90);
-        }
-    };
-
-    private final BluetoothGattCallback callback = new BluetoothGattCallback() {
-        @Override public void onConnectionStateChange(
-            BluetoothGatt bg, int statusCode, int state
-        ) {
-            if (state == BluetoothProfile.STATE_CONNECTED
-                    && statusCode == BluetoothGatt.GATT_SUCCESS) {
-                bg.discoverServices();
-            } else if (state == BluetoothProfile.STATE_DISCONNECTED
-                    || statusCode != BluetoothGatt.GATT_SUCCESS) {
-                if (gatt == bg) {
-                    gatt = null;
-                    writeCharacteristic = null;
-                }
-                bg.close();
-                connected = false;
-                connecting = false;
-
-                handler.post(() -> {
-                    updateStatus();
-                    if (!userDisconnect) scheduleReconnect();
-                });
-            }
-        }
-
-        @Override public void onServicesDiscovered(
-            BluetoothGatt bg, int statusCode
-        ) {
-            BluetoothGattService service = bg.getService(SERVICE_UUID);
-            BluetoothGattCharacteristic c = service == null
-                    ? null : service.getCharacteristic(WRITE_UUID);
-
-            if (statusCode == BluetoothGatt.GATT_SUCCESS && c != null) {
-                c.setWriteType(
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                );
-                writeCharacteristic = c;
-                connected = true;
-                connecting = false;
-
-                handler.post(() -> {
-                    updateStatus();
-                    toast("LEDCAR 연결 완료");
-                });
-
-                // 재연결 시 모드를 재전송하지 않음
-            } else {
-                bg.disconnect();
-            }
-        }
-    };
-
-    @Override public void onCreate(Bundle state) {
-        super.onCreate(state);
-
-        getWindow().setStatusBarColor(Color.rgb(10, 12, 17));
-        getWindow().setNavigationBarColor(Color.rgb(10, 12, 17));
-
-        android.content.SharedPreferences p =
-                getSharedPreferences("ledcar", MODE_PRIVATE);
-
-        speed = p.getInt("speed", 50);
-        brightness = p.getInt("brightness", 100);
-        red = p.getInt("red", 255);
-        green = p.getInt("green", 255);
-        blue = p.getInt("blue", 255);
-        currentMode = p.getInt("mode", 0);
-
-        BluetoothManager manager =
-                (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
-
-        adapter = manager == null ? null : manager.getAdapter();
-
-        buildUi();
-
-        if (Build.VERSION.SDK_INT >= 31 &&
-                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
-                        != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(
-                new String[]{
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.BLUETOOTH_SCAN
-                },
-                100
-            );
-        } else {
-            connect();
-        }
-    }
-
-    @Override public void onRequestPermissionsResult(
-        int code, String[] perms, int[] results
-    ) {
-        super.onRequestPermissionsResult(code, perms, results);
-
-        if (code == 100 && results.length > 0
-                && results[0] == PackageManager.PERMISSION_GRANTED) {
-            connect();
-        } else {
-            toast("블루투스 권한이 필요합니다");
-        }
-    }
-
-    private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setBackgroundColor(Color.rgb(10, 12, 17));
-
-        content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(20), dp(26), dp(20), dp(28));
-
-        scroll.addView(content);
-        setContentView(scroll);
-
-        TextView title = text("엠비언트 설정", 27, Color.WHITE, true);
-        content.addView(title);
-
-        TextView sub = text(
-            "LEDCAR Controller · v0.8",
-            13,
-            Color.rgb(150, 158, 173),
-            false
-        );
-        content.addView(sub);
-        gap(22);
-
-        status = text("연결 확인 중...", 14, accent, true);
-        content.addView(status);
-
-        Button connectButton = button(
-            "블루투스 연결 / 재연결",
-            () -> {
-                userDisconnect = false;
+    private final Runnable reconnect = new Runnable() {
+        @Override
+        public void run() {
+            if (foreground && !connected && !connecting) {
                 connect();
             }
-        );
-        content.addView(connectButton);
-        gap(14);
 
-        LinearLayout powerRow = horizontal();
-        powerRow.addView(
-            button("조명 켜기", () -> send(POWER_ON)),
-            weighted()
-        );
-        powerRow.addView(
-            button("조명 끄기", () -> send(POWER_OFF)),
-            weighted()
-        );
-        content.addView(powerRow);
-        gap(25);
-
-        section("컨트롤러 내장 모드");
-
-        TextView note = text(
-            "모드를 시작하면 컨트롤러가 자체 실행합니다. " +
-            "앱 종료나 블루투스 해제 시 종료 명령을 보내지 않습니다.",
-            13,
-            Color.rgb(172, 183, 199),
-            false
-        );
-        content.addView(note);
-        gap(13);
-
-        content.addView(
-            button("순차 점등 시작", () -> startMode(1))
-        );
-        content.addView(
-            button("무지개 순환 시작", () -> startMode(2))
-        );
-
-        modeLabel = text("", 14, accent, true);
-        content.addView(modeLabel);
-        updateModeLabel();
-        gap(15);
-
-        speedLabel = text(
-            "속도: " + speed,
-            15,
-            Color.WHITE,
-            true
-        );
-        content.addView(speedLabel);
-
-        SeekBar speedBar = new SeekBar(this);
-        speedBar.setMax(99);
-        speedBar.setProgress(speed - 1);
-        speedBar.setProgressTintList(
-            android.content.res.ColorStateList.valueOf(accent)
-        );
-        content.addView(speedBar);
-
-        speedBar.setOnSeekBarChangeListener(
-            new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onProgressChanged(
-                    SeekBar bar, int progress, boolean fromUser
-                ) {
-                    speed = progress + 1;
-                    speedLabel.setText("속도: " + speed);
-
-                    if (fromUser) {
-                        save();
-                        sendSpeed();
-                    }
-                }
-
-                @Override public void onStartTrackingTouch(SeekBar bar) {}
-
-                @Override public void onStopTrackingTouch(SeekBar bar) {
-                    sendSpeed();
-                }
+            if (foreground) {
+                handler.postDelayed(this, 3500);
             }
+        }
+    };
+
+    @Override
+    public void onCreate(Bundle state) {
+        super.onCreate(state);
+
+        prefs = getSharedPreferences(
+            "ledcar_v08",
+            MODE_PRIVATE
         );
 
-        gap(24);
-        section("밝기");
+        brightness = prefs.getInt("brightness", 100);
+        speed = prefs.getInt("speed", 50);
+        color = prefs.getInt("color", Color.RED);
+        mode = prefs.getInt("mode", 0);
+        lightTheme = prefs.getBoolean("light", false);
 
-        brightnessLabel = text(
-            "밝기: " + brightness + "%",
-            15,
-            Color.WHITE,
-            true
-        );
-        content.addView(brightnessLabel);
-
-        SeekBar brightBar = new SeekBar(this);
-        brightBar.setMax(99);
-        brightBar.setProgress(brightness - 1);
-        content.addView(brightBar);
-
-        brightBar.setOnSeekBarChangeListener(
-            new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onProgressChanged(
-                    SeekBar bar, int progress, boolean fromUser
-                ) {
-                    brightness = progress + 1;
-                    brightnessLabel.setText(
-                        "밝기: " + brightness + "%"
-                    );
-
-                    if (fromUser) {
-                        save();
-                        sendBrightness();
-                    }
-                }
-
-                @Override public void onStartTrackingTouch(SeekBar bar) {}
-
-                @Override public void onStopTrackingTouch(SeekBar bar) {
-                    sendBrightness();
-                }
-            }
-        );
-
-        gap(24);
-        section("고정 RGB 색상");
-
-        TextView warning = text(
-            "색상을 선택하면 내장 모드가 중단되고 " +
-            "고정 색상으로 전환됩니다.",
-            12,
-            Color.rgb(172, 183, 199),
-            false
-        );
-        content.addView(warning);
-        gap(10);
-
-        rgbLabel = text("", 14, Color.WHITE, true);
-        content.addView(rgbLabel);
-        updateRgbLabel();
-
-        rgbSlider("R", red, 0);
-        rgbSlider("G", green, 1);
-        rgbSlider("B", blue, 2);
-
-        gap(12);
-
-        int[] colors = {
-            Color.RED,
-            Color.GREEN,
-            Color.BLUE,
-            Color.CYAN,
-            Color.MAGENTA,
-            Color.YELLOW,
-            Color.WHITE
-        };
-
-        LinearLayout presets = horizontal();
-
-        for (int c : colors) {
-            TextView swatch = text("●", 28, c, true);
-            swatch.setGravity(Gravity.CENTER);
-            swatch.setOnClickListener(v ->
-                setRgb(Color.red(c), Color.green(c), Color.blue(c))
+        BluetoothManager manager =
+            (BluetoothManager) getSystemService(
+                Context.BLUETOOTH_SERVICE
             );
-            presets.addView(swatch, weighted());
-        }
 
-        content.addView(presets);
-        gap(16);
+        adapter = manager == null
+            ? null
+            : manager.getAdapter();
 
-        TextView foot = text(
-            "참고: 속도 값의 실제 빠르기 방향 및 중간 밝기 패킷은 " +
-            "기기 테스트로 최종 확인해야 합니다.",
-            12,
-            Color.rgb(135, 143, 159),
-            false
-        );
-        content.addView(foot);
+        render();
+        ensurePermissions();
     }
 
-    private void startMode(int mode) {
-        if (!connected) {
-            toast("먼저 블루투스를 연결하세요");
-            return;
-        }
+    @Override
+    protected void onResume() {
+        super.onResume();
 
-        currentMode = mode;
-        save();
-
-        send(mode == 1 ? SEQUENTIAL : RAINBOW);
-        handler.postDelayed(this::sendSpeed, 180);
-
-        updateModeLabel();
-
-        toast(
-            mode == 1 ? "순차 점등 실행" : "무지개 순환 실행"
-        );
+        foreground = true;
+        handler.removeCallbacks(reconnect);
+        handler.post(reconnect);
     }
 
-    private void sendSpeed() {
-        // 컨트롤러 자체 속도 조절 명령
-        // XX = 01~64 (1~100)
-        send(new byte[]{
-            0x7B,
-            (byte) 0xFF,
-            0x02,
-            (byte) speed,
-            (byte) 0xFF,
-            0x00,
-            (byte) 0xFF,
-            (byte) 0xFF,
-            (byte) 0xBF
-        });
+    @Override
+    protected void onPause() {
+        foreground = false;
+        handler.removeCallbacks(reconnect);
+        super.onPause();
     }
 
-    private void sendBrightness() {
-        // 최소/최대 확인, 중간 값은 실기기 검증 필요
-        int flag = brightness == 1 ? 0x00 : 0x20;
+    @Override
+    protected void onDestroy() {
+        foreground = false;
 
-        send(new byte[]{
-            0x7B,
-            (byte) 0xFF,
-            0x01,
-            (byte) flag,
-            (byte) brightness,
-            0x02,
-            (byte) 0xFF,
-            (byte) 0xFF,
-            (byte) 0xBF
-        });
-    }
+        handler.removeCallbacksAndMessages(null);
 
-    private void rgbSlider(
-        String label, int value, int channel
-    ) {
-        TextView t = text(
-            label,
-            13,
-            Color.rgb(180, 190, 207),
-            true
-        );
-        content.addView(t);
+        // 앱 종료 시 조명 OFF 명령을 보내지 않음.
+        // 컨트롤러 자체 모드가 유지되도록 처리.
 
-        SeekBar bar = new SeekBar(this);
-        bar.setMax(255);
-        bar.setProgress(value);
-        content.addView(bar);
-
-        bar.setOnSeekBarChangeListener(
-            new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onProgressChanged(
-                    SeekBar seekBar, int p, boolean user
-                ) {
-                    if (!user) return;
-
-                    if (channel == 0) {
-                        red = p;
-                    } else if (channel == 1) {
-                        green = p;
-                    } else {
-                        blue = p;
-                    }
-
-                    currentMode = 0;
-                    updateModeLabel();
-                    updateRgbLabel();
-                    save();
-                    sendRgb();
-                }
-
-                @Override public void onStartTrackingTouch(
-                    SeekBar seekBar
-                ) {}
-
-                @Override public void onStopTrackingTouch(
-                    SeekBar seekBar
-                ) {
-                    sendRgb();
-                }
+        if (gatt != null) {
+            try {
+                gatt.disconnect();
+                gatt.close();
+            } catch (Exception ignored) {
             }
+        }
+
+        gatt = null;
+        characteristic = null;
+
+        super.onDestroy();
+    }
+
+    private void ensurePermissions() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            if (
+                checkSelfPermission(
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ) != PackageManager.PERMISSION_GRANTED
+                ||
+                checkSelfPermission(
+                    Manifest.permission.BLUETOOTH_SCAN
+                ) != PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(
+                    new String[]{
+                        Manifest.permission.BLUETOOTH_CONNECT,
+                        Manifest.permission.BLUETOOTH_SCAN
+                    },
+                    101
+                );
+            }
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(
+        int requestCode,
+        String[] permissions,
+        int[] results
+    ) {
+        super.onRequestPermissionsResult(
+            requestCode,
+            permissions,
+            results
         );
-    }
 
-    private void setRgb(int r, int g, int b) {
-        red = r;
-        green = g;
-        blue = b;
-        currentMode = 0;
-
-        save();
-        buildUi();
-        sendRgb();
-    }
-
-    private void sendRgb() {
-        send(new byte[]{
-            0x7B,
-            0x01,
-            0x07,
-            (byte) red,
-            (byte) green,
-            (byte) blue,
-            0x00,
-            (byte) 0xFF,
-            (byte) 0xBF
-        });
-    }
-
-    private void send(byte[] packet) {
-        if (!connected || writeCharacteristic == null) return;
-
-        if (queue.size() > 12) {
-            queue.poll();
+        if (requestCode == 101) {
+            connect();
         }
+    }
 
-        queue.add(packet);
-
-        if (!draining) {
-            draining = true;
-            handler.post(drainRunnable);
-        }
+    private boolean permitted() {
+        return Build.VERSION.SDK_INT < 31
+            ||
+            checkSelfPermission(
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED;
     }
 
     private void connect() {
-        handler.removeCallbacks(reconnect);
-
-        if (connected || connecting) {
-            updateStatus();
+        if (
+            !permitted()
+            || adapter == null
+            || !adapter.isEnabled()
+            || connected
+            || connecting
+        ) {
             return;
         }
 
-        if (adapter == null || !adapter.isEnabled()) {
-            updateStatus();
+        long now =
+            android.os.SystemClock.elapsedRealtime();
+
+        if (now - lastConnectAttempt < 3000) {
             return;
         }
 
-        if (Build.VERSION.SDK_INT >= 31 &&
-                checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
-                        != PackageManager.PERMISSION_GRANTED) {
-            return;
-        }
+        lastConnectAttempt = now;
+        connecting = true;
+
+        setStatus("연결 중…");
 
         try {
-            connecting = true;
-            updateStatus();
-
             BluetoothDevice device =
-                adapter.getRemoteDevice(DEVICE_ADDRESS);
+                adapter.getRemoteDevice(ADDRESS);
+
+            if (gatt != null) {
+                try {
+                    gatt.close();
+                } catch (Exception ignored) {
+                }
+
+                gatt = null;
+            }
 
             gatt = device.connectGatt(
                 this,
@@ -579,158 +263,236 @@ public class MainActivity extends Activity {
                 callback,
                 BluetoothDevice.TRANSPORT_LE
             );
+
         } catch (Exception e) {
             connecting = false;
-            updateStatus();
-            toast("연결 실패: " + e.getMessage());
+            setStatus("연결 실패");
         }
     }
 
-    private void scheduleReconnect() {
-        handler.removeCallbacks(reconnect);
-        handler.postDelayed(reconnect, 3500);
-    }
+    private final BluetoothGattCallback callback =
+        new BluetoothGattCallback() {
 
-    private void updateStatus() {
-        if (status == null) return;
-
-        status.setText(
-            connected
-                ? "● 연결됨 · " + DEVICE_ADDRESS
-                : connecting
-                    ? "● 연결 중..."
-                    : "● 연결 안 됨"
-        );
-
-        status.setTextColor(
-            connected
-                ? Color.rgb(69, 215, 145)
-                : accent
-        );
-    }
-
-    private void updateModeLabel() {
-        if (modeLabel != null) {
-            modeLabel.setText(
-                "현재 선택: " +
-                (currentMode == 1
-                    ? "순차 점등"
-                    : currentMode == 2
-                        ? "무지개 순환"
-                        : "고정 RGB")
-            );
+        @Override
+        public void onConnectionStateChange(
+            BluetoothGatt source,
+            int statusCode,
+            int newState
+        ) {
+            if (
+                newState == BluetoothProfile.STATE_CONNECTED
+                &&
+                statusCode == BluetoothGatt.GATT_SUCCESS
+            ) {
+                try {
+                    source.discoverServices();
+                } catch (SecurityException e) {
+                    connectionLost(source);
+                }
+            } else {
+                connectionLost(source);
+            }
         }
-    }
 
-    private void updateRgbLabel() {
-        if (rgbLabel != null) {
-            rgbLabel.setText(
-                String.format(
-                    Locale.US,
-                    "RGB  %d · %d · %d    #%02X%02X%02X",
-                    red, green, blue,
-                    red, green, blue
-                )
-            );
+        @Override
+        public void onServicesDiscovered(
+            BluetoothGatt source,
+            int statusCode
+        ) {
+            if (
+                statusCode != BluetoothGatt.GATT_SUCCESS
+            ) {
+                connectionLost(source);
+                return;
+            }
+
+            BluetoothGattService service =
+                source.getService(SERVICE);
+
+            BluetoothGattCharacteristic c =
+                service == null
+                    ? null
+                    : service.getCharacteristic(WRITE);
+
+            if (c == null) {
+                connectionLost(source);
+                return;
+            }
+
+            handler.post(() -> {
+                if (source != gatt) {
+                    return;
+                }
+
+                characteristic = c;
+                connecting = false;
+                connected = true;
+                sending = false;
+
+                setStatus("연결됨");
+                drain();
+
+                // 재연결 시 기존 조명 모드를 덮어쓰지 않음.
+            });
         }
-    }
 
-    private void save() {
-        getSharedPreferences("ledcar", MODE_PRIVATE)
-            .edit()
-            .putInt("mode", currentMode)
-            .putInt("speed", speed)
-            .putInt("brightness", brightness)
-            .putInt("red", red)
-            .putInt("green", green)
-            .putInt("blue", blue)
-            .apply();
-    }
+        @Override
+        public void onCharacteristicWrite(
+            BluetoothGatt source,
+            BluetoothGattCharacteristic c,
+            int statusCode
+        ) {
+            handler.post(() -> {
+                if (source != gatt) {
+                    return;
+                }
 
-    private void section(String title) {
-        content.addView(text(title, 19, Color.WHITE, true));
-        gap(10);
-    }
+                sending = false;
 
-    private void gap(int size) {
-        View v = new View(this);
-        content.addView(
-            v,
-            new LinearLayout.LayoutParams(1, dp(size))
-        );
-    }
+                handler.postDelayed(
+                    () -> drain(),
+                    65
+                );
+            });
+        }
+    };
 
-    private TextView text(
-        String s, int sp, int color, boolean bold
+    private void connectionLost(
+        BluetoothGatt source
     ) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextSize(sp);
-        t.setTextColor(color);
+        handler.post(() -> {
+            if (source != gatt) {
+                return;
+            }
 
-        if (bold) {
-            t.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            connected = false;
+            connecting = false;
+            characteristic = null;
+            sending = false;
+
+            outbound.clear();
+
+            setStatus("연결 끊김 · 자동 재연결");
+
+            try {
+                source.close();
+            } catch (Exception ignored) {
+            }
+
+            if (gatt == source) {
+                gatt = null;
+            }
+        });
+    }
+
+    private void send(byte[] bytes) {
+        if (
+            !connected
+            || characteristic == null
+        ) {
+            toast("블루투스 연결을 확인해 주세요");
+            connect();
+            return;
         }
 
-        t.setPadding(0, dp(4), 0, dp(4));
-        return t;
+        outbound.offer(bytes);
+        drain();
     }
 
-    private Button button(String label, Runnable action) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setTextColor(Color.WHITE);
-        b.setAllCaps(false);
-        b.setTextSize(14);
-        b.setOnClickListener(v -> action.run());
+    private void drain() {
+        if (
+            !connected
+            || sending
+            || characteristic == null
+            || gatt == null
+            || outbound.isEmpty()
+        ) {
+            return;
+        }
 
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.rgb(33, 40, 54));
-        bg.setCornerRadius(dp(13));
-        bg.setStroke(dp(1), Color.rgb(59, 70, 91));
+        byte[] packet = outbound.poll();
 
-        b.setBackground(bg);
+        sending = true;
 
-        LinearLayout.LayoutParams p =
-            new LinearLayout.LayoutParams(-1, dp(49));
+        try {
+            int result;
 
-        p.bottomMargin = dp(9);
-        b.setLayoutParams(p);
+            if (Build.VERSION.SDK_INT >= 33) {
+                result = gatt.writeCharacteristic(
+                    characteristic,
+                    packet,
+                    BluetoothGattCharacteristic
+                        .WRITE_TYPE_NO_RESPONSE
+                );
+            } else {
+                characteristic.setWriteType(
+                    BluetoothGattCharacteristic
+                        .WRITE_TYPE_NO_RESPONSE
+                );
 
-        return b;
+                characteristic.setValue(packet);
+
+                result = gatt.writeCharacteristic(
+                    characteristic
+                )
+                    ? BluetoothGatt.GATT_SUCCESS
+                    : -1;
+            }
+
+            if (
+                result != BluetoothGatt.GATT_SUCCESS
+            ) {
+                sending = false;
+
+                handler.postDelayed(
+                    () -> drain(),
+                    130
+                );
+            } else {
+                handler.postDelayed(() -> {
+                    if (sending) {
+                        sending = false;
+                        drain();
+                    }
+                }, 130);
+            }
+
+        } catch (Exception e) {
+            sending = false;
+
+            handler.postDelayed(
+                () -> drain(),
+                150
+            );
+        }
     }
 
-    private LinearLayout horizontal() {
-        LinearLayout l = new LinearLayout(this);
-        l.setOrientation(LinearLayout.HORIZONTAL);
-        return l;
+    private void setStatus(String text) {
+        handler.post(() -> {
+            if (status != null) {
+                status.setText("● " + text);
+            }
+        });
     }
 
-    private LinearLayout.LayoutParams weighted() {
-        LinearLayout.LayoutParams p =
-            new LinearLayout.LayoutParams(0, dp(49), 1);
-
-        p.setMargins(dp(3), 0, dp(3), dp(8));
-        return p;
-    }
-
-    private int dp(int d) {
-        return (int) (
-            getResources().getDisplayMetrics().density * d + 0.5f
+    private void toast(String text) {
+        handler.post(() ->
+            Toast.makeText(
+                this,
+                text,
+                Toast.LENGTH_SHORT
+            ).show()
         );
     }
 
-    private void toast(String s) {
-        Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
-    }
+    private static byte[] hex(String input) {
+        String[] parts = input.split(" ");
 
-    private static byte[] hex(String s) {
-        String v = s.replace(" ", "");
-        byte[] b = new byte[v.length() / 2];
+        byte[] b = new byte[parts.length];
 
-        for (int i = 0; i < b.length; i++) {
+        for (int i = 0; i < parts.length; i++) {
             b[i] = (byte) Integer.parseInt(
-                v.substring(i * 2, i * 2 + 2),
+                parts[i],
                 16
             );
         }
@@ -738,19 +500,1078 @@ public class MainActivity extends Activity {
         return b;
     }
 
-    @Override protected void onDestroy() {
-        // 앱 종료 시 모드 종료/전원 끄기 명령 전송하지 않음
-        userDisconnect = true;
-        handler.removeCallbacksAndMessages(null);
+    private byte[] rgbPacket() {
+        return new byte[]{
+            0x7B,
+            0x01,
+            0x07,
+            (byte) Color.red(color),
+            (byte) Color.green(color),
+            (byte) Color.blue(color),
+            0x00,
+            (byte) 0xFF,
+            (byte) 0xBF
+        };
+    }
 
-        if (gatt != null) {
-            try {
-                gatt.close();
-            } catch (Exception ignored) {}
+    private byte[] speedPacket() {
+        return new byte[]{
+            0x7B,
+            (byte) 0xFF,
+            0x02,
+            (byte) Math.max(
+                1,
+                Math.min(100, speed)
+            ),
+            (byte) 0xFF,
+            0x00,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xBF
+        };
+    }
 
-            gatt = null;
+    private byte[] brightnessPacket() {
+        int b = Math.max(
+            1,
+            Math.min(100, brightness)
+        );
+
+        return new byte[]{
+            0x7B,
+            (byte) 0xFF,
+            0x01,
+            (byte) (b == 1 ? 0x00 : 0x20),
+            (byte) b,
+            0x02,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xBF
+        };
+    }
+
+    private void setBrightness(int v) {
+        brightness = Math.max(1, v);
+
+        prefs.edit()
+            .putInt("brightness", brightness)
+            .apply();
+
+        send(brightnessPacket());
+    }
+
+    private void setSpeed(int v) {
+        speed = Math.max(1, v);
+
+        prefs.edit()
+            .putInt("speed", speed)
+            .apply();
+
+        send(speedPacket());
+    }
+
+    private void selectColor(int c) {
+        color = Color.rgb(
+            Color.red(c),
+            Color.green(c),
+            Color.blue(c)
+        );
+
+        prefs.edit()
+            .putInt("color", color)
+            .apply();
+
+        send(rgbPacket());
+    }
+
+    private void startMode() {
+        send(
+            mode == 0
+                ? SEQUENTIAL
+                : RAINBOW
+        );
+
+        handler.postDelayed(() -> {
+            if (connected) {
+                send(speedPacket());
+            }
+        }, 230);
+    }
+
+    private void stopMode() {
+        send(rgbPacket());
+    }
+
+    private void render() {
+        if (lightTheme) {
+            themeBg = 0xFFF6F7FA;
+            themePanel = Color.WHITE;
+            themeText = 0xFF15161A;
+            themeMuted = 0xFF616572;
+        } else {
+            themeBg = 0xFF101116;
+            themePanel = 0xFF202127;
+            themeText = Color.WHITE;
+            themeMuted = 0xFFB8BAC5;
         }
 
-        super.onDestroy();
+        root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+
+        root.setPadding(
+            dp(18),
+            dp(18),
+            dp(18),
+            dp(12)
+        );
+
+        root.setBackgroundColor(themeBg);
+
+        setContentView(root);
+
+        LinearLayout heading = row();
+
+        TextView title = label(
+            "엠비언트 설정",
+            23,
+            true
+        );
+
+        heading.addView(
+            title,
+            new LinearLayout.LayoutParams(
+                0,
+                dp(44),
+                1
+            )
+        );
+
+        Button powerButton = button(
+            power ? "전원 ON" : "전원 OFF"
+        );
+
+        heading.addView(powerButton);
+
+        powerButton.setOnClickListener(v -> {
+            power = !power;
+
+            send(
+                power
+                    ? POWER_ON
+                    : POWER_OFF
+            );
+
+            render();
+        });
+
+        root.addView(heading);
+
+        status = label(
+            "● " + (
+                connected
+                    ? "연결됨"
+                    : "연결 대기 중"
+            ),
+            13,
+            false
+        );
+
+        status.setTextColor(
+            connected
+                ? 0xFF4BD69B
+                : themeMuted
+        );
+
+        root.addView(status);
+
+        space(root, 14);
+
+        LinearLayout nav = row();
+
+        Button colors = button("색상");
+        Button modes = button("모드");
+        Button settings = button("설정");
+
+        nav.addView(
+            colors,
+            new LinearLayout.LayoutParams(
+                0,
+                dp(48),
+                1
+            )
+        );
+
+        nav.addView(
+            modes,
+            new LinearLayout.LayoutParams(
+                0,
+                dp(48),
+                1
+            )
+        );
+
+        nav.addView(
+            settings,
+            new LinearLayout.LayoutParams(
+                0,
+                dp(48),
+                1
+            )
+        );
+
+        colors.setAlpha(
+            tab == 0 ? 1f : .55f
+        );
+
+        modes.setAlpha(
+            tab == 1 ? 1f : .55f
+        );
+
+        settings.setAlpha(
+            tab == 2 ? 1f : .55f
+        );
+
+        colors.setOnClickListener(v -> {
+            tab = 0;
+            render();
+        });
+
+        modes.setOnClickListener(v -> {
+            tab = 1;
+            render();
+        });
+
+        settings.setOnClickListener(v -> {
+            tab = 2;
+            render();
+        });
+
+        root.addView(nav);
+
+        space(root, 12);
+
+        ScrollView scroll =
+            new ScrollView(this);
+
+        scroll.setFillViewport(false);
+
+        root.addView(
+            scroll,
+            new LinearLayout.LayoutParams(
+                -1,
+                0,
+                1
+            )
+        );
+
+        content = new LinearLayout(this);
+
+        content.setOrientation(
+            LinearLayout.VERTICAL
+        );
+
+        content.setPadding(
+            0,
+            dp(8),
+            0,
+            dp(24)
+        );
+
+        scroll.addView(content);
+
+        if (tab == 0) {
+            colorPage();
+        } else if (tab == 1) {
+            modePage();
+        } else {
+            settingsPage();
+        }
+    }
+
+    private void colorPage() {
+        content.addView(
+            label(
+                "원하는 색상을 선택하세요",
+                18,
+                true
+            )
+        );
+
+        space(content, 12);
+
+        ColorWheel wheel =
+            new ColorWheel(this);
+
+        content.addView(
+            wheel,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(270)
+            )
+        );
+
+        space(content, 10);
+
+        TextView hexLabel = label(
+            String.format(
+                Locale.US,
+                "#%06X",
+                0xFFFFFF & color
+            ),
+            16,
+            true
+        );
+
+        hexLabel.setGravity(
+            Gravity.CENTER
+        );
+
+        content.addView(hexLabel);
+
+        wheel.listener = c -> {
+            selectColor(c);
+
+            hexLabel.setText(
+                String.format(
+                    Locale.US,
+                    "#%06X",
+                    0xFFFFFF & color
+                )
+            );
+        };
+
+        space(content, 18);
+
+        int[] palette = {
+            0xFFFF3030,
+            0xFFFF9C22,
+            0xFFFFEB3B,
+            0xFF37D76B,
+            0xFF2D8CFF,
+            0xFFA84AFF
+        };
+
+        LinearLayout swatches = row();
+
+        for (int c : palette) {
+            Button b = button("●");
+
+            b.setTextColor(c);
+
+            swatches.addView(
+                b,
+                new LinearLayout.LayoutParams(
+                    0,
+                    dp(52),
+                    1
+                )
+            );
+
+            b.setOnClickListener(v -> {
+                selectColor(c);
+                render();
+            });
+        }
+
+        content.addView(swatches);
+
+        space(content, 12);
+
+        colorSlider(
+            "R",
+            Color.red(color),
+            0xFFFF6666,
+            0
+        );
+
+        colorSlider(
+            "G",
+            Color.green(color),
+            0xFF55D18C,
+            1
+        );
+
+        colorSlider(
+            "B",
+            Color.blue(color),
+            0xFF5D9BFF,
+            2
+        );
+
+        brightnessControl();
+    }
+
+    private void colorSlider(
+        String name,
+        int initial,
+        int tint,
+        int component
+    ) {
+        TextView title = label(
+            name + "  " + initial,
+            14,
+            true
+        );
+
+        content.addView(title);
+
+        SeekBar bar = new SeekBar(this);
+
+        bar.setMax(255);
+        bar.setProgress(initial);
+
+        bar.setProgressTintList(
+            android.content.res.ColorStateList
+                .valueOf(tint)
+        );
+
+        content.addView(bar);
+
+        bar.setOnSeekBarChangeListener(
+            new SimpleSeek() {
+                @Override
+                public void onProgressChanged(
+                    SeekBar s,
+                    int p,
+                    boolean user
+                ) {
+                    if (!user) {
+                        return;
+                    }
+
+                    int r = Color.red(color);
+                    int g = Color.green(color);
+                    int b = Color.blue(color);
+
+                    if (component == 0) {
+                        r = p;
+                    } else if (component == 1) {
+                        g = p;
+                    } else {
+                        b = p;
+                    }
+
+                    color = Color.rgb(r, g, b);
+
+                    title.setText(
+                        name + "  " + p
+                    );
+                }
+
+                @Override
+                public void onStopTrackingTouch(
+                    SeekBar s
+                ) {
+                    selectColor(color);
+                }
+            }
+        );
+    }
+
+    private void modePage() {
+        content.addView(
+            label(
+                "컨트롤러 자체 조명 효과",
+                19,
+                true
+            )
+        );
+
+        space(content, 8);
+
+        TextView explanation = label(
+            "한 번 실행하면 휴대폰 연결이 끊겨도 " +
+            "컨트롤러가 효과를 계속 실행할 수 있습니다.",
+            14,
+            false
+        );
+
+        explanation.setTextColor(
+            themeMuted
+        );
+
+        content.addView(explanation);
+
+        space(content, 18);
+
+        Button sequential =
+            button("순차 점등");
+
+        Button rainbow =
+            button("무지개 순환");
+
+        sequential.setAlpha(
+            mode == 0 ? 1f : .55f
+        );
+
+        rainbow.setAlpha(
+            mode == 1 ? 1f : .55f
+        );
+
+        content.addView(
+            sequential,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(54)
+            )
+        );
+
+        space(content, 8);
+
+        content.addView(
+            rainbow,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(54)
+            )
+        );
+
+        sequential.setOnClickListener(v -> {
+            mode = 0;
+
+            prefs.edit()
+                .putInt("mode", mode)
+                .apply();
+
+            render();
+        });
+
+        rainbow.setOnClickListener(v -> {
+            mode = 1;
+
+            prefs.edit()
+                .putInt("mode", mode)
+                .apply();
+
+            render();
+        });
+
+        space(content, 22);
+
+        LinearLayout actions = row();
+
+        Button start =
+            button("▶  효과 시작");
+
+        Button stop =
+            button("■  효과 종료");
+
+        actions.addView(
+            start,
+            new LinearLayout.LayoutParams(
+                0,
+                dp(58),
+                1
+            )
+        );
+
+        actions.addView(
+            stop,
+            new LinearLayout.LayoutParams(
+                0,
+                dp(58),
+                1
+            )
+        );
+
+        content.addView(actions);
+
+        start.setOnClickListener(
+            v -> startMode()
+        );
+
+        stop.setOnClickListener(
+            v -> stopMode()
+        );
+
+        space(content, 22);
+
+        TextView speedLabel = label(
+            "효과 속도  ·  " + speed,
+            16,
+            true
+        );
+
+        content.addView(speedLabel);
+
+        SeekBar speedBar =
+            new SeekBar(this);
+
+        speedBar.setMax(99);
+        speedBar.setProgress(speed - 1);
+
+        content.addView(speedBar);
+
+        LinearLayout extremes = row();
+
+        TextView slow = label(
+            "느리게",
+            12,
+            false
+        );
+
+        TextView fast = label(
+            "빠르게",
+            12,
+            false
+        );
+
+        extremes.addView(
+            slow,
+            new LinearLayout.LayoutParams(
+                0,
+                -2,
+                1
+            )
+        );
+
+        extremes.addView(fast);
+
+        content.addView(extremes);
+
+        speedBar.setOnSeekBarChangeListener(
+            new SimpleSeek() {
+                @Override
+                public void onProgressChanged(
+                    SeekBar s,
+                    int p,
+                    boolean user
+                ) {
+                    if (user) {
+                        speed = p + 1;
+
+                        speedLabel.setText(
+                            "효과 속도  ·  " + speed
+                        );
+                    }
+                }
+
+                @Override
+                public void onStopTrackingTouch(
+                    SeekBar s
+                ) {
+                    setSpeed(speed);
+                }
+            }
+        );
+
+        space(content, 24);
+
+        brightnessControl();
+
+        space(content, 20);
+
+        TextView tip = label(
+            "효과 종료 시 마지막으로 선택한 " +
+            "고정 RGB 색상으로 돌아갑니다. " +
+            "속도 값의 빠름/느림 방향은 " +
+            "실차에서 확인해 주세요.",
+            13,
+            false
+        );
+
+        tip.setTextColor(themeMuted);
+
+        content.addView(tip);
+    }
+
+    private void brightnessControl() {
+        space(content, 14);
+
+        TextView title = label(
+            "밝기  ·  " + brightness + "%",
+            16,
+            true
+        );
+
+        content.addView(title);
+
+        SeekBar bar = new SeekBar(this);
+
+        bar.setMax(99);
+        bar.setProgress(brightness - 1);
+
+        content.addView(bar);
+
+        bar.setOnSeekBarChangeListener(
+            new SimpleSeek() {
+                @Override
+                public void onProgressChanged(
+                    SeekBar s,
+                    int p,
+                    boolean user
+                ) {
+                    if (user) {
+                        brightness = p + 1;
+
+                        title.setText(
+                            "밝기  ·  " +
+                            brightness + "%"
+                        );
+                    }
+                }
+
+                @Override
+                public void onStopTrackingTouch(
+                    SeekBar s
+                ) {
+                    setBrightness(brightness);
+                }
+            }
+        );
+    }
+
+    private void settingsPage() {
+        content.addView(
+            label(
+                "연결 및 화면 설정",
+                19,
+                true
+            )
+        );
+
+        space(content, 16);
+
+        content.addView(
+            label(
+                "컨트롤러: LEDCAR-01-047B",
+                15,
+                false
+            )
+        );
+
+        space(content, 8);
+
+        content.addView(
+            label(
+                "BLE 주소: " + ADDRESS,
+                13,
+                false
+            )
+        );
+
+        space(content, 20);
+
+        Button retry =
+            button("블루투스 다시 연결");
+
+        content.addView(
+            retry,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(54)
+            )
+        );
+
+        retry.setOnClickListener(v -> {
+            if (gatt != null) {
+                try {
+                    gatt.disconnect();
+                    gatt.close();
+                } catch (Exception ignored) {
+                }
+
+                gatt = null;
+            }
+
+            connected = false;
+            connecting = false;
+            characteristic = null;
+            lastConnectAttempt = 0;
+
+            connect();
+        });
+
+        space(content, 12);
+
+        Button theme = button(
+            lightTheme
+                ? "다크 모드로 변경"
+                : "라이트 모드로 변경"
+        );
+
+        content.addView(
+            theme,
+            new LinearLayout.LayoutParams(
+                -1,
+                dp(54)
+            )
+        );
+
+        theme.setOnClickListener(v -> {
+            lightTheme = !lightTheme;
+
+            prefs.edit()
+                .putBoolean(
+                    "light",
+                    lightTheme
+                )
+                .apply();
+
+            render();
+        });
+
+        space(content, 24);
+
+        TextView warning = label(
+            "주의: 앱을 종료하거나 블루투스를 끊어도 " +
+            "컨트롤러의 모드가 유지되는지는 " +
+            "장치 펌웨어 동작에 따라 달라집니다. " +
+            "앱 종료 시 OFF 명령은 전송하지 않습니다.",
+            13,
+            false
+        );
+
+        warning.setTextColor(
+            themeMuted
+        );
+
+        content.addView(warning);
+    }
+
+    private LinearLayout row() {
+        LinearLayout l =
+            new LinearLayout(this);
+
+        l.setOrientation(
+            LinearLayout.HORIZONTAL
+        );
+
+        l.setGravity(
+            Gravity.CENTER_VERTICAL
+        );
+
+        return l;
+    }
+
+    private TextView label(
+        String s,
+        int size,
+        boolean bold
+    ) {
+        TextView t = new TextView(this);
+
+        t.setText(s);
+        t.setTextSize(size);
+        t.setTextColor(themeText);
+
+        t.setGravity(
+            Gravity.CENTER_VERTICAL
+        );
+
+        if (bold) {
+            t.setTypeface(null, 1);
+        }
+
+        return t;
+    }
+
+    private Button button(String s) {
+        Button b = new Button(this);
+
+        b.setText(s);
+        b.setAllCaps(false);
+        b.setTextColor(themeText);
+
+        b.setBackgroundTintList(
+            android.content.res.ColorStateList
+                .valueOf(themePanel)
+        );
+
+        b.setPadding(
+            dp(6),
+            0,
+            dp(6),
+            0
+        );
+
+        return b;
+    }
+
+    private void space(
+        LinearLayout parent,
+        int height
+    ) {
+        View v = new View(this);
+
+        parent.addView(
+            v,
+            new LinearLayout.LayoutParams(
+                1,
+                dp(height)
+            )
+        );
+    }
+
+    private int dp(float v) {
+        return (int) (
+            getResources()
+                .getDisplayMetrics()
+                .density * v + .5f
+        );
+    }
+
+    private static abstract class SimpleSeek
+        implements SeekBar.OnSeekBarChangeListener {
+
+        @Override
+        public void onStartTrackingTouch(
+            SeekBar s
+        ) {
+        }
+
+        @Override
+        public void onStopTrackingTouch(
+            SeekBar s
+        ) {
+        }
+
+        @Override
+        public void onProgressChanged(
+            SeekBar s,
+            int progress,
+            boolean user
+        ) {
+        }
+    }
+
+    private class ColorWheel extends View {
+
+        final Paint p = new Paint(3);
+
+        final float[] hsv = {
+            0,
+            1,
+            1
+        };
+
+        java.util.function.Consumer<Integer> listener;
+
+        ColorWheel(Context c) {
+            super(c);
+
+            setLayerType(
+                View.LAYER_TYPE_SOFTWARE,
+                null
+            );
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+
+            float cx = getWidth() / 2f;
+            float cy = getHeight() / 2f;
+
+            float r = Math.min(
+                getWidth(),
+                getHeight()
+            ) * .43f;
+
+            p.setStyle(
+                Paint.Style.STROKE
+            );
+
+            p.setStrokeWidth(dp(28));
+
+            for (int i = 0; i < 360; i += 2) {
+                hsv[0] = i;
+
+                p.setColor(
+                    Color.HSVToColor(hsv)
+                );
+
+                canvas.drawArc(
+                    new RectF(
+                        cx - r,
+                        cy - r,
+                        cx + r,
+                        cy + r
+                    ),
+                    i - 90,
+                    2.7f,
+                    false,
+                    p
+                );
+            }
+
+            p.setStyle(
+                Paint.Style.FILL
+            );
+
+            p.setColor(color);
+
+            canvas.drawCircle(
+                cx,
+                cy,
+                r * .53f,
+                p
+            );
+
+            p.setColor(Color.WHITE);
+
+            p.setStyle(
+                Paint.Style.STROKE
+            );
+
+            p.setStrokeWidth(dp(3));
+
+            canvas.drawCircle(
+                cx,
+                cy,
+                r * .54f,
+                p
+            );
+
+            p.setStyle(
+                Paint.Style.FILL
+            );
+        }
+
+        @Override
+        public boolean onTouchEvent(
+            MotionEvent e
+        ) {
+            if (
+                e.getAction() == MotionEvent.ACTION_DOWN
+                ||
+                e.getAction() == MotionEvent.ACTION_MOVE
+                ||
+                e.getAction() == MotionEvent.ACTION_UP
+            ) {
+                float a = (float) Math.toDegrees(
+                    Math.atan2(
+                        e.getY() - getHeight() / 2f,
+                        e.getX() - getWidth() / 2f
+                    )
+                ) + 90;
+
+                if (a < 0) {
+                    a += 360;
+                }
+
+                hsv[0] = a;
+                hsv[1] = 1;
+                hsv[2] = 1;
+
+                int c = Color.HSVToColor(hsv);
+
+                color = c;
+
+                invalidate();
+
+                if (
+                    e.getAction() == MotionEvent.ACTION_UP
+                    &&
+                    listener != null
+                ) {
+                    listener.accept(c);
+                }
+
+                return true;
+            }
+
+            return true;
+        }
     }
 }
