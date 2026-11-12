@@ -1125,7 +1125,7 @@ public class MainActivity extends Activity {
                     handler.post(speedTask);
                 }
             }
-        );
+            });
 
         modeStateLabel = text(
             modeRunning
