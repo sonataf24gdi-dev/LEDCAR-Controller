@@ -1,25 +1,4 @@
 
 plugins {
-    id 'com.android.application'
-}
-
-android {
-    namespace 'com.ledcar.ambient'
-    compileSdk 35
-
-    defaultConfig {
-        applicationId 'com.ledcar.ambient'
-        minSdk 23
-        targetSdk 35
-        versionCode 11
-        versionName '1.1'
-    }
-
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
-    }
-}
-
-dependencies {
+    id 'com.android.application' version '8.6.1' apply false
 }
