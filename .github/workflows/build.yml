@@ -49,9 +49,8 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-       - name: Configure Android SDK
+      - name: Configure Android SDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           yes | sdkmanager --licenses >/dev/null || true
       - name: Install Android SDK 35
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
