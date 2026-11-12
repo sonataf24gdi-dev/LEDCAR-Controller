@@ -1,9 +1,8 @@
 
-package com.example.ledcar;
+package com.ledcar.ambient;
 
 import android.Manifest;
-import android.app.Activity;
-import android.app.AlertDialog;
+import android.app.*;
 import android.bluetooth.*;
 import android.bluetooth.le.*;
 import android.content.*;
@@ -11,22 +10,20 @@ import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.*;
 import android.os.*;
+import android.text.InputType;
 import android.view.*;
 import android.widget.*;
-
 import java.util.*;
 
 public class MainActivity extends Activity {
 
-    // ==============================
-    // BLE
-    // ==============================
+    private static final UUID SERVICE = UUID.fromString(
+        "0000ffe0-0000-1000-8000-00805f9b34fb"
+    );
 
-    private static final UUID SERVICE_UUID =
-        UUID.fromString("0000ffe0-0000-1000-8000-00805f9b34fb");
-
-    private static final UUID WRITE_UUID =
-        UUID.fromString("0000ffe1-0000-1000-8000-00805f9b34fb");
+    private static final UUID WRITE = UUID.fromString(
+        "0000ffe1-0000-1000-8000-00805f9b34fb"
+    );
 
     private static final byte[] ON =
         hex("7BFF0407FFFFFFFFBF");
@@ -40,389 +37,2011 @@ public class MainActivity extends Activity {
     private static final byte[] RAINBOW =
         hex("7BFF0301FFFFFFFFBF");
 
-    private static final int REQUEST_BLE = 1001;
-    private static final String PASSWORD = "8884";
+    private final Handler handler =
+        new Handler(Looper.getMainLooper());
 
     private BluetoothAdapter adapter;
     private BluetoothLeScanner scanner;
     private BluetoothGatt gatt;
     private BluetoothGattCharacteristic writeChar;
 
-    private final Handler handler =
-        new Handler(Looper.getMainLooper());
+    private final LinkedHashMap<String, BluetoothDevice> candidates =
+        new LinkedHashMap<>();
+
+    private String savedAddress = "";
+    private String deviceName = "";
+    private String connectionText = "기기 미등록";
+
+    private boolean active;
+    private boolean scanning;
+    private boolean connecting;
+    private boolean connected;
+    private boolean choosing;
+    private boolean updating;
+    private boolean settingsVisible;
+    private boolean developerVisible;
+
+    private boolean powerOn = true;
+    private boolean dark = false;
+    private boolean modeRunning = false;
+    private boolean phoneSequential = false;
+
+    private int currentTab = 0;
+
+    private int r = 255;
+    private int g = 0;
+    private int b = 0;
+
+    private int brightness = 100;
+    private int selectedMode = 0;
+    private int modeSpeed = 50;
+    private int phoneStep = 0;
+
+    private final int[] presets = new int[6];
+    private final boolean[] presetSaved = new boolean[6];
+
+    private LinearLayout mainRoot;
+    private LinearLayout settingsPage;
+    private LinearLayout developerPage;
+    private LinearLayout contentContainer;
+    private LinearLayout presetRow;
+
+    private TextView mainStatus;
+    private TextView settingsStatus;
+    private TextView settingsDevice;
+    private TextView colorLabel;
+    private TextView brightnessLabel;
+    private TextView speedLabel;
+    private TextView modeStateLabel;
+    private TextView developerLog;
+
+    private SeekBar redBar;
+    private SeekBar greenBar;
+    private SeekBar blueBar;
+    private SeekBar brightnessBar;
+    private SeekBar speedBar;
+
+    private ColorWheel wheel;
+    private IconView powerIcon;
+    private Button modeButton;
 
     private final ArrayDeque<byte[]> sendQueue =
         new ArrayDeque<>();
 
-    private final LinkedHashMap<String, BluetoothDevice>
-        foundDevices = new LinkedHashMap<>();
-
     private boolean sending = false;
-    private boolean scanning = false;
-    private boolean connected = false;
-    private boolean connecting = false;
 
-    private String deviceAddress = "";
-    private String deviceName = "";
+    private final StringBuilder logBuffer =
+        new StringBuilder();
 
-    // ==============================
-    // APP STATE
-    // ==============================
+    // BLE 전송 큐
+    private final Runnable sendTask = new Runnable() {
+        @Override
+        public void run() {
+            if (!connected || gatt == null || writeChar == null) {
+                sendQueue.clear();
+                sending = false;
+                return;
+            }
 
-    private android.content.SharedPreferences prefs;
+            byte[] packet = sendQueue.poll();
 
-    private int currentPage = 0;
-    // 0 color, 1 mode, 2 settings, 3 developer
+            if (packet == null) {
+                sending = false;
+                return;
+            }
 
-    private boolean darkTheme = true;
-    private boolean autoReconnect = true;
-    private boolean powerOn = true;
+            try {
+                int props = writeChar.getProperties();
 
-    private int red = 255;
-    private int green = 255;
-    private int blue = 255;
+                int type =
+                    (props &
+                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)
+                    != 0
+                    ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
 
-    private int brightness = 100;
-    private int speed = 50;
+                if (Build.VERSION.SDK_INT >= 33) {
+                    int result = gatt.writeCharacteristic(
+                        writeChar,
+                        packet,
+                        type
+                    );
 
-    private int selectedMode = 0;
-    // 0 sequential, 1 rainbow
+                    if (result != BluetoothStatusCodes.SUCCESS) {
+                        log("BLE 쓰기 실패: " + result);
+                    }
+                } else {
+                    writeChar.setWriteType(type);
+                    writeChar.setValue(packet);
 
-    private boolean modeRunning = false;
+                    if (!gatt.writeCharacteristic(writeChar)) {
+                        log("BLE 쓰기 요청 실패");
+                    }
+                }
+            } catch (Exception e) {
+                log(
+                    "BLE 전송 예외: " +
+                    e.getClass().getSimpleName()
+                );
+            }
 
-    private int sequentialEngine = 0;
-    // 0 controller, 1 smartphone
-
-    private int developerSpeed = 1;
-
-    private final int[] presets = {
-        Color.RED,
-        Color.GREEN,
-        Color.BLUE,
-        Color.YELLOW,
-        Color.CYAN,
-        Color.MAGENTA
+            handler.postDelayed(this, 110);
+        }
     };
 
-    private LinearLayout root;
-    private LinearLayout content;
-    private TextView statusText;
-
-    private SeekBar speedBar;
-    private TextView speedValue;
-    private TextView modeStateText;
-
-    private final ArrayList<String> commandLogs =
-        new ArrayList<>();
-
-    private Runnable phoneAnimation;
-    private boolean phoneAnimationActive = false;
-    private long phoneAnimationStart = 0;
-
-    private int commandGeneration = 0;
-
-    // ==============================
-    // LIFECYCLE
-    // ==============================
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        prefs = getSharedPreferences(
-            "ledcar_preferences",
-            MODE_PRIVATE
-        );
-
-        loadSettings();
-
-        BluetoothManager manager =
-            (BluetoothManager) getSystemService(
-                Context.BLUETOOTH_SERVICE
-            );
-
-        if (manager != null) {
-            adapter = manager.getAdapter();
+    private final Runnable colorTask = () -> {
+        if (connected && !modeRunning && powerOn) {
+            send(rgbPacket(r, g, b));
         }
+    };
 
-        buildPage();
-
-        requestBluetoothPermissions();
-
-        if (autoReconnect && !deviceAddress.isEmpty()) {
-            handler.postDelayed(
-                () -> reconnectSavedDevice(),
-                1200
-            );
+    private final Runnable brightnessTask = () -> {
+        if (connected) {
+            send(brightnessPacket(brightness));
         }
-    }
+    };
 
-    @Override
-    protected void onDestroy() {
-        // Controller-native animations should not
-        // be stopped merely because the app closes.
-        stopPhoneAnimation();
+    private final Runnable speedTask = () -> {
+        if (connected &&
+            !(modeRunning &&
+              selectedMode == 0 &&
+              phoneSequential)) {
 
+            send(speedPacket(modeSpeed));
+        }
+    };
+
+    private final Runnable retryTask = () -> {
+        if (active &&
+            !connected &&
+            !connecting &&
+            !choosing) {
+
+            scanSaved();
+        }
+    };
+
+    private final Runnable timeoutTask = () -> {
         stopScan();
 
-        clearSendQueue();
+        if (choosing) {
+            choosing = false;
+            showCandidates();
+        } else if (active && !connected && !connecting) {
+            setStatus("차량 검색 대기 중");
+            scheduleRetry();
+        }
+    };
 
-        disconnectGatt();
+    // 스마트폰 직접 실행 순차 점등
+    private final Runnable phoneTask = new Runnable() {
+        @Override
+        public void run() {
+            if (!modeRunning ||
+                selectedMode != 0 ||
+                !phoneSequential ||
+                !powerOn ||
+                !connected) {
+                return;
+            }
 
-        handler.removeCallbacksAndMessages(null);
+            final int[][] colors = {
+                {255, 0, 0},
+                {255, 255, 0},
+                {0, 255, 0},
+                {0, 255, 255},
+                {0, 0, 255},
+                {255, 0, 255}
+            };
 
-        super.onDestroy();
-    }
+            int[] c = colors[phoneStep % colors.length];
 
-    // ==============================
-    // SETTINGS PERSISTENCE
-    // ==============================
+            send(rgbPacket(c[0], c[1], c[2]));
 
-    private void loadSettings() {
-        darkTheme = prefs.getBoolean("darkTheme", true);
-        autoReconnect = prefs.getBoolean(
-            "autoReconnect", true
-        );
-        powerOn = prefs.getBoolean("powerOn", true);
+            phoneStep = (phoneStep + 1) % colors.length;
 
-        red = prefs.getInt("red", 255);
-        green = prefs.getInt("green", 255);
-        blue = prefs.getInt("blue", 255);
-
-        brightness = prefs.getInt("brightness", 100);
-        speed = prefs.getInt("speed", 50);
-
-        selectedMode = prefs.getInt("selectedMode", 0);
-        sequentialEngine = prefs.getInt(
-            "sequentialEngine", 0
-        );
-
-        deviceAddress = prefs.getString(
-            "deviceAddress", ""
-        );
-
-        deviceName = prefs.getString(
-            "deviceName", ""
-        );
-
-        for (int i = 0; i < presets.length; i++) {
-            presets[i] = prefs.getInt(
-                "preset_" + i,
-                presets[i]
+            handler.postDelayed(
+                this,
+                phoneIntervalMillis(modeSpeed)
             );
         }
+    };
 
-        // Do not assume an effect is still running
-        // after a fresh application launch.
-        modeRunning = false;
-    }
+    private static long phoneIntervalMillis(int speed) {
+        double f =
+            Math.max(0, Math.min(100, speed)) / 100.0;
 
-    private void saveSettings() {
-        android.content.SharedPreferences.Editor e =
-            prefs.edit();
-
-        e.putBoolean("darkTheme", darkTheme);
-        e.putBoolean("autoReconnect", autoReconnect);
-        e.putBoolean("powerOn", powerOn);
-
-        e.putInt("red", red);
-        e.putInt("green", green);
-        e.putInt("blue", blue);
-
-        e.putInt("brightness", brightness);
-        e.putInt("speed", speed);
-
-        e.putInt("selectedMode", selectedMode);
-        e.putInt("sequentialEngine", sequentialEngine);
-
-        e.putString("deviceAddress", deviceAddress);
-        e.putString("deviceName", deviceName);
-
-        for (int i = 0; i < presets.length; i++) {
-            e.putInt("preset_" + i, presets[i]);
-        }
-
-        e.apply();
-    }
-
-    // ==============================
-    // COLORS / THEME
-    // ==============================
-
-    private int backgroundColor() {
-        return darkTheme
-            ? Color.rgb(16, 17, 20)
-            : Color.rgb(247, 248, 250);
-    }
-
-    private int surfaceColor() {
-        return darkTheme
-            ? Color.rgb(31, 33, 38)
-            : Color.WHITE;
-    }
-
-    private int textColor() {
-        return darkTheme
-            ? Color.WHITE
-            : Color.rgb(25, 27, 32);
-    }
-
-    private int secondaryColor() {
-        return darkTheme
-            ? Color.rgb(170, 174, 185)
-            : Color.rgb(100, 105, 115);
-    }
-
-    private int accentColor() {
-        return Color.rgb(68, 133, 255);
-    }
-
-    private int dp(float value) {
-        return (int) (
-            value * getResources()
-                .getDisplayMetrics().density + 0.5f
+        return Math.max(
+            200L,
+            Math.round(
+                60000.0 *
+                Math.pow(200.0 / 60000.0, f)
+            )
         );
     }
 
-    private android.graphics.drawable.GradientDrawable
-    rounded(int color, int radius) {
-
-        android.graphics.drawable.GradientDrawable d =
-            new android.graphics.drawable.GradientDrawable();
-
-        d.setColor(color);
-        d.setCornerRadius(dp(radius));
-
-        return d;
+    private void stopPhoneTask() {
+        handler.removeCallbacks(phoneTask);
     }
 
-    // ==============================
-    // UI HELPERS
-    // ==============================
+    private void startPhoneTask() {
+        stopPhoneTask();
+        phoneStep = 0;
+        handler.post(phoneTask);
+    }
+
+    // BLE 검색
+    private final ScanCallback scanCallback =
+        new ScanCallback() {
+
+        @Override
+        public void onScanResult(
+            int type,
+            ScanResult result
+        ) {
+            BluetoothDevice device = result.getDevice();
+
+            if (device == null) return;
+
+            String address;
+
+            try {
+                address = device.getAddress();
+            } catch (SecurityException e) {
+                return;
+            }
+
+            if (address == null) return;
+
+            String name =
+                result.getScanRecord() == null
+                ? null
+                : result.getScanRecord().getDeviceName();
+
+            if (name == null) {
+                try {
+                    name = device.getName();
+                } catch (SecurityException ignored) {}
+            }
+
+            final String foundName = name;
+
+            handler.post(() -> {
+                if (!active || connected || connecting) {
+                    return;
+                }
+
+                if (!choosing &&
+                    !savedAddress.isEmpty() &&
+                    savedAddress.equalsIgnoreCase(address)) {
+
+                    connect(device, foundName);
+
+                } else if (choosing) {
+                    candidates.put(address, device);
+                }
+            });
+        }
+
+        @Override
+        public void onScanFailed(int error) {
+            handler.post(() -> {
+                scanning = false;
+
+                handler.removeCallbacks(timeoutTask);
+
+                setStatus("검색 실패 (" + error + ")");
+
+                if (choosing) {
+                    choosing = false;
+                    showCandidates();
+                } else {
+                    scheduleRetry();
+                }
+            });
+        }
+    };
+
+    // GATT 연결
+    private final BluetoothGattCallback gattCallback =
+        new BluetoothGattCallback() {
+
+        @Override
+        public void onConnectionStateChange(
+            BluetoothGatt current,
+            int code,
+            int state
+        ) {
+            handler.post(() -> {
+                if (current != gatt) {
+                    try {
+                        current.close();
+                    } catch (Exception ignored) {}
+                    return;
+                }
+
+                if (code == BluetoothGatt.GATT_SUCCESS &&
+                    state == BluetoothProfile.STATE_CONNECTED) {
+
+                    setStatus("서비스 확인 중...");
+
+                    try {
+                        if (!current.discoverServices()) {
+                            lost(current, "서비스 검색 실패");
+                        }
+                    } catch (SecurityException e) {
+                        lost(current, "블루투스 권한 오류");
+                    }
+                } else {
+                    lost(current, "연결 끊김 · 재연결 대기");
+                }
+            });
+        }
+
+        @Override
+        public void onServicesDiscovered(
+            BluetoothGatt current,
+            int code
+        ) {
+            handler.post(() -> {
+                if (current != gatt) return;
+
+                BluetoothGattService service =
+                    code == BluetoothGatt.GATT_SUCCESS
+                    ? current.getService(SERVICE)
+                    : null;
+
+                writeChar =
+                    service == null
+                    ? null
+                    : service.getCharacteristic(WRITE);
+
+                if (writeChar == null ||
+                    (writeChar.getProperties() &
+                    (BluetoothGattCharacteristic.PROPERTY_WRITE |
+                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE))
+                    == 0) {
+
+                    lost(
+                        current,
+                        "호환되지 않는 기기 (FFE0/FFE1 없음)"
+                    );
+                    return;
+                }
+
+                connected = true;
+                connecting = false;
+
+                try {
+                    savedAddress =
+                        current.getDevice().getAddress();
+
+                    String name =
+                        current.getDevice().getName();
+
+                    if (name != null && !name.isEmpty()) {
+                        deviceName = name;
+                    }
+                } catch (SecurityException ignored) {}
+
+                prefs().edit()
+                    .putString("last_device", savedAddress)
+                    .putString("last_name", deviceName)
+                    .apply();
+
+                setStatus("연결 완료");
+
+                // 내장 모드는 재연결 시 덮어쓰지 않음.
+                if (modeRunning &&
+                    selectedMode == 0 &&
+                    phoneSequential &&
+                    powerOn) {
+
+                    startPhoneTask();
+                }
+            });
+        }
+    };
+
+    @Override
+    public void onCreate(Bundle state) {
+        super.onCreate(state);
+
+        SharedPreferences p = prefs();
+
+        savedAddress =
+            p.getString("last_device", "");
+
+        deviceName =
+            p.getString("last_name", "");
+
+        dark =
+            p.getBoolean("dark_theme", false);
+
+        brightness =
+            p.getInt("brightness", 100);
+
+        modeSpeed =
+            p.getInt("mode_speed", 50);
+
+        selectedMode =
+            p.getInt("selected_mode", 0);
+
+        modeRunning =
+            p.getBoolean("mode_running", false);
+
+        phoneSequential =
+            p.getBoolean("phone_sequential", false);
+
+        if (phoneSequential && selectedMode == 0) {
+            modeRunning = false;
+        }
+
+        r = p.getInt("color_r", 255);
+        g = p.getInt("color_g", 0);
+        b = p.getInt("color_b", 0);
+
+        for (int i = 0; i < 6; i++) {
+            presetSaved[i] =
+                p.contains("preset_" + i);
+
+            presets[i] =
+                p.getInt("preset_" + i, Color.WHITE);
+        }
+
+        BluetoothManager manager =
+            (BluetoothManager)
+            getSystemService(BLUETOOTH_SERVICE);
+
+        adapter =
+            manager == null
+            ? null
+            : manager.getAdapter();
+
+        buildMainPage();
+        showMainPage();
+
+        if (hasPermissions()) {
+            startAuto();
+        } else {
+            requestNeededPermissions();
+        }
+    }
+
+    private SharedPreferences prefs() {
+        return getPreferences(MODE_PRIVATE);
+    }
+
+    // 테마
+    private int fg() {
+        return dark
+            ? Color.WHITE
+            : Color.rgb(40, 43, 49);
+    }
+
+    private int muted() {
+        return dark
+            ? Color.rgb(174, 179, 189)
+            : Color.rgb(112, 117, 125);
+    }
+
+    private int bg() {
+        return dark
+            ? Color.rgb(17, 19, 24)
+            : Color.rgb(250, 250, 251);
+    }
+
+    private int surface() {
+        return dark
+            ? Color.rgb(37, 40, 48)
+            : Color.rgb(233, 235, 239);
+    }
+
+    private int accent() {
+        return Color.rgb(0, 165, 139);
+    }
+
+    private int dp(int value) {
+        return (int)(
+            value *
+            getResources().getDisplayMetrics().density
+            + 0.5f
+        );
+    }
 
     private TextView text(
         String value,
-        float size,
-        boolean bold
+        int size,
+        int color
     ) {
-        TextView t = new TextView(this);
+        TextView view = new TextView(this);
 
-        t.setText(value);
-        t.setTextColor(textColor());
-        t.setTextSize(size);
+        view.setText(value);
+        view.setTextSize(size);
+        view.setTextColor(color);
 
-        if (bold) {
-            t.setTypeface(
-                null,
-                android.graphics.Typeface.BOLD
-            );
-        }
-
-        return t;
+        return view;
     }
 
     private LinearLayout column() {
-        LinearLayout l = new LinearLayout(this);
-        l.setOrientation(LinearLayout.VERTICAL);
-        return l;
-    }
+        LinearLayout view = new LinearLayout(this);
 
-    private LinearLayout row() {
-        LinearLayout l = new LinearLayout(this);
-        l.setOrientation(LinearLayout.HORIZONTAL);
-        l.setGravity(Gravity.CENTER_VERTICAL);
-        return l;
-    }
+        view.setOrientation(LinearLayout.VERTICAL);
 
-    private void addSpace(
-        LinearLayout parent,
-        int height
-    ) {
-        View v = new View(this);
-
-        parent.addView(
-            v,
-            new LinearLayout.LayoutParams(
-                1,
-                dp(height)
-            )
+        view.setPadding(
+            dp(18), dp(18), dp(18), dp(18)
         );
+
+        view.setBackgroundColor(bg());
+
+        return view;
     }
 
-    private void addTitle(
+    private void section(
         LinearLayout parent,
         String title
     ) {
-        TextView t = text(title, 17, true);
-        parent.addView(t);
-        addSpace(parent, 12);
-    }
+        TextView view = text(title, 19, fg());
 
-    private LinearLayout card() {
-        LinearLayout l = column();
-
-        l.setPadding(
-            dp(16), dp(16),
-            dp(16), dp(16)
+        view.setPadding(
+            0, dp(22), 0, dp(10)
         );
 
-        l.setBackground(
-            rounded(surfaceColor(), 18)
-        );
-
-        return l;
+        parent.addView(view);
     }
 
-    private void addCard(
+    private Button button(
         LinearLayout parent,
-        LinearLayout child
+        String label,
+        Runnable action
     ) {
-        LinearLayout.LayoutParams p =
+        Button view = new Button(this);
+
+        view.setText(label);
+        view.setTextColor(fg());
+        view.setAllCaps(false);
+
+        view.setBackgroundTintList(
+            ColorStateList.valueOf(surface())
+        );
+
+        LinearLayout.LayoutParams params =
             new LinearLayout.LayoutParams(
-                -1, -2
+                -1, dp(52)
             );
 
-        p.bottomMargin = dp(14);
+        params.bottomMargin = dp(9);
 
-        parent.addView(child, p);
+        parent.addView(view, params);
+
+        view.setOnClickListener(v -> action.run());
+
+        return view;
     }
 
-    private Button button(String label) {
-        Button b = new Button(this);
+    // Android 16 시스템 바 여백 처리
+    private void showPage(LinearLayout page) {
+        if (page.getParent() != null) {
+            ((ViewGroup)page.getParent())
+                .removeView(page);
+        }
 
-        b.setText(label);
-        b.setTextColor(Color.WHITE);
-        b.setAllCaps(false);
-        b.setTextSize(14);
+        ScrollView scroll = new ScrollView(this);
 
-        b.setBackgroundTintList(
-            ColorStateList.valueOf(accentColor())
-        );
+        scroll.setFillViewport(true);
+        scroll.addView(page);
 
-        return b;
+        if (Build.VERSION.SDK_INT >= 35) {
+            scroll.setOnApplyWindowInsetsListener(
+                (view, insets) -> {
+
+                    android.graphics.Insets bars =
+                        insets.getInsets(
+                            WindowInsets.Type.systemBars() |
+                            WindowInsets.Type.displayCutout()
+                        );
+
+                    view.setPadding(
+                        bars.left,
+                        bars.top,
+                        bars.right,
+                        bars.bottom
+                    );
+
+                    return insets;
+                }
+            );
+        }
+
+        setContentView(scroll);
+
+        if (Build.VERSION.SDK_INT >= 35) {
+            scroll.requestApplyInsets();
+        }
+
+        updateStatusViews();
     }
 
-    private Button secondaryButton(String label) {
-        Button b = button(label);
+    private void showMainPage() {
+        settingsVisible = false;
+        developerVisible = false;
+        showPage(mainRoot);
+    }
 
-        b.setBackgroundTintList(
-            ColorStateList.valueOf(
-                darkTheme
-                    ? Color.rgb(66, 69, 78)
-                    : Color.rgb(105, 111, 125)
+    private void showSettingsPage() {
+        settingsVisible = true;
+        developerVisible = false;
+
+        buildSettingsPage();
+        showPage(settingsPage);
+    }
+
+    private void showDeveloperPage() {
+        settingsVisible = false;
+        developerVisible = true;
+
+        buildDeveloperPage();
+        showPage(developerPage);
+    }
+
+    // 메인 화면
+    private void buildMainPage() {
+        mainRoot = column();
+
+        LinearLayout header =
+            new LinearLayout(this);
+
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        mainRoot.addView(header);
+
+        TextView title =
+            text("엠비언트 설정", 25, fg());
+
+        header.addView(
+            title,
+            new LinearLayout.LayoutParams(
+                0, dp(56), 1
             )
         );
 
-        return b;
+        IconView settingsIcon =
+            new IconView(this, false);
+
+        settingsIcon.setContentDescription(
+            "차량 연결 설정"
+        );
+
+        header.addView(
+            settingsIcon,
+            new LinearLayout.LayoutParams(
+                dp(48), dp(52)
+            )
+        );
+
+        settingsIcon.setOnClickListener(
+            v -> showSettingsPage()
+        );
+
+        powerIcon =
+            new IconView(this, true);
+
+        header.addView(
+            powerIcon,
+            new LinearLayout.LayoutParams(
+                dp(48), dp(52)
+            )
+        );
+
+        powerIcon.setContentDescription(
+            powerOn ? "전원 끄기" : "전원 켜기"
+        );
+
+        powerIcon.setOnClickListener(v -> {
+            if (!connected) {
+                toast("차량 연결을 확인하세요");
+                return;
+            }
+
+            powerOn = !powerOn;
+
+            if (!powerOn) {
+                stopModeLocal();
+            }
+
+            powerIcon.invalidate();
+
+            powerIcon.setContentDescription(
+                powerOn ? "전원 끄기" : "전원 켜기"
+            );
+
+            send(powerOn ? ON : OFF);
+        });
+
+        mainStatus =
+            text("연결 상태 확인 중", 14, muted());
+
+        mainStatus.setPadding(
+            0, dp(9), 0, dp(12)
+        );
+
+        mainRoot.addView(mainStatus);
+
+        // 색상 / 모드 탭
+        LinearLayout tabs =
+            new LinearLayout(this);
+
+        mainRoot.addView(tabs);
+
+        Button colorTab =
+            new Button(this);
+
+        Button modeTab =
+            new Button(this);
+
+        colorTab.setText("색상");
+        modeTab.setText("모드");
+
+        colorTab.setAllCaps(false);
+        modeTab.setAllCaps(false);
+
+        tabs.addView(
+            colorTab,
+            new LinearLayout.LayoutParams(
+                0, dp(52), 1
+            )
+        );
+
+        tabs.addView(
+            modeTab,
+            new LinearLayout.LayoutParams(
+                0, dp(52), 1
+            )
+        );
+
+        colorTab.setOnClickListener(v -> {
+            currentTab = 0;
+            buildMainPage();
+            showMainPage();
+        });
+
+        modeTab.setOnClickListener(v -> {
+            currentTab = 1;
+            buildMainPage();
+            showMainPage();
+        });
+
+        colorTab.setTextColor(
+            currentTab == 0 ? Color.WHITE : fg()
+        );
+
+        modeTab.setTextColor(
+            currentTab == 1 ? Color.WHITE : fg()
+        );
+
+        colorTab.setBackgroundTintList(
+            ColorStateList.valueOf(
+                currentTab == 0 ? accent() : surface()
+            )
+        );
+
+        modeTab.setBackgroundTintList(
+            ColorStateList.valueOf(
+                currentTab == 1 ? accent() : surface()
+            )
+        );
+
+        contentContainer =
+            new LinearLayout(this);
+
+        contentContainer.setOrientation(
+            LinearLayout.VERTICAL
+        );
+
+        mainRoot.addView(contentContainer);
+
+        if (currentTab == 0) {
+            buildColorPage();
+        } else {
+            buildModePage();
+        }
+
+        buildBrightnessControl(contentContainer);
+
+        updateStatusViews();
     }
 
-    private void addDescription(
-        LinearLayout parent,
-        String message
+    // 색상 화면
+    private void buildColorPage() {
+        section(contentContainer, "색상표");
+
+        wheel = new ColorWheel(this);
+
+        contentContainer.addView(
+            wheel,
+            new LinearLayout.LayoutParams(
+                -1, dp(290)
+            )
+        );
+
+        wheel.setOnColorChange(
+            (nr, ng, nb) ->
+                setColor(nr, ng, nb, true, true)
+        );
+
+        colorLabel = text("", 17, fg());
+
+        colorLabel.setPadding(
+            0, dp(10), 0, 0
+        );
+
+        contentContainer.addView(colorLabel);
+
+        section(contentContainer, "색상 프리셋");
+
+        contentContainer.addView(
+            text(
+                "짧게 누르면 적용 · 길게 누르면 현재 색상 저장",
+                12,
+                muted()
+            )
+        );
+
+        presetRow =
+            new LinearLayout(this);
+
+        presetRow.setPadding(
+            0, dp(9), 0, 0
+        );
+
+        contentContainer.addView(presetRow);
+
+        refreshPresets();
+
+        section(contentContainer, "RGB");
+
+        redBar =
+            rgbSeek(contentContainer, "R", r);
+
+        greenBar =
+            rgbSeek(contentContainer, "G", g);
+
+        blueBar =
+            rgbSeek(contentContainer, "B", b);
+
+        SeekBar.OnSeekBarChangeListener listener =
+            new SeekBar.OnSeekBarChangeListener() {
+
+            @Override
+            public void onProgressChanged(
+                SeekBar bar,
+                int progress,
+                boolean fromUser
+            ) {
+                if (fromUser && !updating) {
+                    setColor(
+                        redBar.getProgress(),
+                        greenBar.getProgress(),
+                        blueBar.getProgress(),
+                        false,
+                        true
+                    );
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(
+                SeekBar bar
+            ) {}
+
+            @Override
+            public void onStopTrackingTouch(
+                SeekBar bar
+            ) {
+                queueColor();
+            }
+        };
+
+        redBar.setOnSeekBarChangeListener(listener);
+        greenBar.setOnSeekBarChangeListener(listener);
+        blueBar.setOnSeekBarChangeListener(listener);
+
+        updateColorLabel();
+
+        wheel.setSelectedColor(
+            Color.rgb(r, g, b)
+        );
+    }
+
+    // 모드 화면
+    private void buildModePage() {
+        section(contentContainer, "조명 효과");
+
+        contentContainer.addView(
+            text(
+                "컨트롤러가 직접 실행하는 조명 효과",
+                14,
+                muted()
+            )
+        );
+
+        RadioGroup group =
+            new RadioGroup(this);
+
+        group.setOrientation(RadioGroup.VERTICAL);
+
+        group.setPadding(
+            0, dp(14), 0, dp(8)
+        );
+
+        contentContainer.addView(group);
+
+        RadioButton seq =
+            new RadioButton(this);
+
+        RadioButton rainbow =
+            new RadioButton(this);
+
+        seq.setText("순차 점등");
+        rainbow.setText("무지개 순환");
+
+        seq.setTextColor(fg());
+        rainbow.setTextColor(fg());
+
+        seq.setId(2001);
+        rainbow.setId(2002);
+
+        group.addView(seq);
+        group.addView(rainbow);
+
+        if (selectedMode == 0) {
+            seq.setChecked(true);
+        } else {
+            rainbow.setChecked(true);
+        }
+
+        group.setOnCheckedChangeListener(
+            (radioGroup, id) -> {
+                int next = id == 2001 ? 0 : 1;
+
+                if (selectedMode == next) return;
+
+                stopPhoneTask();
+
+                selectedMode = next;
+
+                prefs().edit()
+                    .putInt("selected_mode", selectedMode)
+                    .apply();
+
+                if (modeRunning && connected) {
+                    sendModeCommand();
+                }
+
+                updateModeUI();
+            }
+        );
+
+        section(contentContainer, "전환 속도");
+
+        speedLabel =
+            text(modeSpeed + "%", 15, muted());
+
+        contentContainer.addView(speedLabel);
+
+        speedBar = new SeekBar(this);
+
+        speedBar.setMax(99);
+
+        speedBar.setProgress(
+            Math.max(1, Math.min(100, modeSpeed)) - 1
+        );
+
+        contentContainer.addView(speedBar);
+
+        LinearLayout hints =
+            new LinearLayout(this);
+
+        hints.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView slow =
+            text("느리게", 13, muted());
+
+        TextView fast =
+            text("빠르게", 13, muted());
+
+        hints.addView(
+            slow,
+            new LinearLayout.LayoutParams(
+                0, -2, 1
+            )
+        );
+
+        fast.setGravity(Gravity.RIGHT);
+
+        hints.addView(
+            fast,
+            new LinearLayout.LayoutParams(
+                0, -2, 1
+            )
+        );
+
+        contentContainer.addView(hints);
+
+        speedBar.setOnSeekBarChangeListener(
+            new SeekBar.OnSeekBarChangeListener() {
+
+            @Override
+            public void onProgressChanged(
+                SeekBar bar,
+                int progress,
+                boolean fromUser
+            ) {
+                if (!fromUser) return;
+
+                modeSpeed = progress + 1;
+
+                speedLabel.setText(
+                    modeSpeed + "%"
+                );
+
+                prefs().edit()
+                    .putInt("mode_speed", modeSpeed)
+                    .apply();
+
+                if (modeRunning &&
+                    selectedMode == 0 &&
+                    phoneSequential) {
+
+                    stopPhoneTask();
+
+                    handler.postDelayed(
+                        phoneTask,
+                        phoneIntervalMillis(modeSpeed)
+                    );
+                } else {
+                    handler.removeCallbacks(speedTask);
+
+                    handler.postDelayed(
+                        speedTask, 140
+                    );
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(
+                SeekBar bar
+            ) {}
+
+            @Override
+            public void onStopTrackingTouch(
+                SeekBar bar
+            ) {
+                if (!(modeRunning &&
+                      selectedMode == 0 &&
+                      phoneSequential)) {
+
+                    handler.removeCallbacks(speedTask);
+                    handler.post(speedTask);
+                }
+            }
+        );
+
+        modeStateLabel = text(
+            modeRunning
+                ? "조명 효과 실행 중"
+                : "조명 효과 중지됨",
+            14,
+            modeRunning ? accent() : muted()
+        );
+
+        modeStateLabel.setPadding(
+            0, dp(22), 0, dp(10)
+        );
+
+        contentContainer.addView(modeStateLabel);
+
+        modeButton = button(
+            contentContainer,
+            modeRunning
+                ? "조명 효과 중지"
+                : "조명 효과 시작",
+            () -> {
+                if (modeRunning) {
+                    stopMode();
+                } else {
+                    startMode();
+                }
+            }
+        );
+
+        TextView note = text(
+            "효과 시작 명령을 컨트롤러에 전송합니다. " +
+            "앱 종료 또는 블루투스 연결 해제 시 " +
+            "효과 종료 명령은 전송하지 않습니다.",
+            12,
+            muted()
+        );
+
+        note.setPadding(
+            0, dp(12), 0, dp(8)
+        );
+
+        contentContainer.addView(note);
+    }
+
+    // 공통 밝기 조절
+    private void buildBrightnessControl(
+        LinearLayout parent
     ) {
-        TextView t = text(message, 13, false);
-        t.setTextColor(secondaryColor());
-        parent.addView(t);
+        section(parent, "밝기 조절");
+
+        brightnessLabel = text(
+            brightness + "%",
+            15,
+            muted()
+        );
+
+        parent.addView(brightnessLabel);
+
+        brightnessBar = new SeekBar(this);
+
+        brightnessBar.setMax(99);
+
+        brightnessBar.setProgress(
+            Math.max(1, Math.min(100, brightness)) - 1
+        );
+
+        parent.addView(brightnessBar);
+
+        brightnessBar.setOnSeekBarChangeListener(
+            new SeekBar.OnSeekBarChangeListener() {
+
+            @Override
+            public void onProgressChanged(
+                SeekBar bar,
+                int progress,
+                boolean fromUser
+            ) {
+                if (!fromUser) return;
+
+                brightness = progress + 1;
+
+                brightnessLabel.setText(
+                    brightness + "%"
+                );
+
+                prefs().edit()
+                    .putInt("brightness", brightness)
+                    .apply();
+
+                handler.removeCallbacks(brightnessTask);
+
+                handler.postDelayed(
+                    brightnessTask, 120
+                );
+            }
+
+            @Override
+            public void onStartTrackingTouch(
+                SeekBar bar
+            ) {}
+
+            @Override
+            public void onStopTrackingTouch(
+                SeekBar bar
+            ) {
+                handler.removeCallbacks(brightnessTask);
+                handler.post(brightnessTask);
+            }
+        });
+    }
+
+    // 모드 시작
+    private void startMode() {
+        if (!connected) {
+            toast("차량을 먼저 연결하세요");
+            return;
+        }
+
+        if (!powerOn) {
+            toast("조명 전원을 먼저 켜세요");
+            return;
+        }
+
+        modeRunning = true;
+
+        saveModeRunning();
+
+        handler.removeCallbacks(colorTask);
+
+        sendModeCommand();
+
+        updateModeUI();
+    }
+
+    // 모드 명령
+    private void sendModeCommand() {
+        if (!connected) return;
+
+        stopPhoneTask();
+
+        handler.removeCallbacks(speedTask);
+
+        if (selectedMode == 0 && phoneSequential) {
+            startPhoneTask();
+        } else {
+            send(
+                selectedMode == 0
+                    ? SEQUENTIAL
+                    : RAINBOW
+            );
+
+            handler.postDelayed(
+                speedTask, 240
+            );
+        }
+    }
+
+    private void stopMode() {
+        if (!modeRunning) return;
+
+        stopModeLocal();
+
+        if (connected) {
+            send(rgbPacket(r, g, b));
+        }
+    }
+
+    private void stopModeLocal() {
+        modeRunning = false;
+
+        saveModeRunning();
+
+        stopPhoneTask();
+
+        handler.removeCallbacks(speedTask);
+
+        updateModeUI();
+    }
+
+    private void saveModeRunning() {
+        prefs().edit()
+            .putBoolean("mode_running", modeRunning)
+            .apply();
+    }
+
+    private void updateModeUI() {
+        if (modeButton != null) {
+            modeButton.setText(
+                modeRunning
+                    ? "조명 효과 중지"
+                    : "조명 효과 시작"
+            );
+        }
+
+        if (modeStateLabel != null) {
+            String name =
+                selectedMode == 0
+                    ? "순차 점등"
+                    : "무지개 순환";
+
+            modeStateLabel.setText(
+                modeRunning
+                    ? name + " 실행 중"
+                    : name + " 중지됨"
+            );
+
+            modeStateLabel.setTextColor(
+                modeRunning ? accent() : muted()
+            );
+        }
+    }
+
+    private SeekBar rgbSeek(
+        LinearLayout parent,
+        String name,
+        int value
+    ) {
+        parent.addView(
+            text(name, 13, muted())
+        );
+
+        SeekBar bar = new SeekBar(this);
+
+        bar.setMax(255);
+        bar.setProgress(value);
+
+        parent.addView(bar);
+
+        return bar;
+    }
+
+    private void setColor(
+        int nr,
+        int ng,
+        int nb,
+        boolean fromWheel,
+        boolean manual
+    ) {
+        if (manual && modeRunning) {
+            stopModeLocal();
+        }
+
+        r = nr;
+        g = ng;
+        b = nb;
+
+        if (fromWheel && redBar != null) {
+            updating = true;
+
+            redBar.setProgress(r);
+            greenBar.setProgress(g);
+            blueBar.setProgress(b);
+
+            updating = false;
+        }
+
+        if (!fromWheel && wheel != null) {
+            wheel.setSelectedColor(
+                Color.rgb(r, g, b)
+            );
+        }
+
+        updateColorLabel();
+
+        if (manual) {
+            prefs().edit()
+                .putInt("color_r", r)
+                .putInt("color_g", g)
+                .putInt("color_b", b)
+                .apply();
+        }
+
+        queueColor();
+    }
+
+    private void updateColorLabel() {
+        if (colorLabel == null) return;
+
+        colorLabel.setText(
+            String.format(
+                Locale.US,
+                "#%02X%02X%02X  ·  R %d  G %d  B %d",
+                r, g, b, r, g, b
+            )
+        );
+
+        colorLabel.setTextColor(
+            Color.rgb(r, g, b)
+        );
+    }
+
+    private void queueColor() {
+        handler.removeCallbacks(colorTask);
+
+        if (!modeRunning) {
+            handler.postDelayed(colorTask, 100);
+        }
+    }
+
+    // 프리셋
+    private void refreshPresets() {
+        if (presetRow == null) return;
+
+        presetRow.removeAllViews();
+
+        for (int i = 0; i < 6; i++) {
+            final int index = i;
+
+            TextView swatch = text(
+                presetSaved[i] ? "●" : "+",
+                28,
+                presetSaved[i]
+                    ? presets[i]
+                    : muted()
+            );
+
+            swatch.setGravity(Gravity.CENTER);
+
+            LinearLayout.LayoutParams params =
+                new LinearLayout.LayoutParams(
+                    0, dp(55), 1
+                );
+
+            params.setMargins(
+                dp(2), 0, dp(2), 0
+            );
+
+            presetRow.addView(swatch, params);
+
+            swatch.setOnClickListener(v -> {
+                if (!presetSaved[index]) {
+                    toast("길게 눌러 색상을 저장하세요");
+                    return;
+                }
+
+                int color = presets[index];
+
+                setColor(
+                    Color.red(color),
+                    Color.green(color),
+                    Color.blue(color),
+                    false,
+                    true
+                );
+            });
+
+            swatch.setOnLongClickListener(v -> {
+                int color = Color.rgb(r, g, b);
+
+                new AlertDialog.Builder(this)
+                    .setTitle(
+                        "프리셋 " + (index + 1) + " 저장"
+                    )
+                    .setMessage(
+                        String.format(
+                            Locale.US,
+                            "현재 색상 #%06X을 저장할까요?",
+                            color & 0xffffff
+                        )
+                    )
+                    .setPositiveButton(
+                        "저장",
+                        (dialog, which) -> {
+                            presets[index] = color;
+                            presetSaved[index] = true;
+
+                            prefs().edit()
+                                .putInt(
+                                    "preset_" + index,
+                                    color
+                                )
+                                .apply();
+
+                            refreshPresets();
+                        }
+                    )
+                    .setNegativeButton("취소", null)
+                    .show();
+
+                return true;
+            });
+        }
+    }
+
+    // 설정 화면
+    private void buildSettingsPage() {
+        settingsPage = column();
+
+        LinearLayout header =
+            new LinearLayout(this);
+
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        settingsPage.addView(header);
+
+        IconView back =
+            new IconView(this, false, true);
+
+        header.addView(
+            back,
+            new LinearLayout.LayoutParams(
+                dp(42), dp(50)
+            )
+        );
+
+        back.setContentDescription(
+            "메인 화면으로 돌아가기"
+        );
+
+        back.setOnClickListener(
+            v -> showMainPage()
+        );
+
+        header.addView(
+            text("차량 연결 설정", 24, fg())
+        );
+
+        section(settingsPage, "블루투스 연결 상태");
+
+        settingsStatus =
+            text("", 19, accent());
+
+        settingsStatus.setPadding(
+            0, dp(6), 0, dp(8)
+        );
+
+        settingsPage.addView(settingsStatus);
+
+        settingsDevice =
+            text("", 14, muted());
+
+        settingsDevice.setPadding(
+            0, 0, 0, dp(14)
+        );
+
+        settingsPage.addView(settingsDevice);
+
+        button(
+            settingsPage,
+            "차량 연결",
+            () -> {
+                if (connected) {
+                    toast("이미 연결되어 있습니다");
+                    return;
+                }
+
+                if (savedAddress.isEmpty()) {
+                    startDevicePicker();
+                } else {
+                    active = true;
+                    scanSaved();
+                }
+            }
+        );
+
+        button(
+            settingsPage,
+            "다른 차량 선택",
+            this::startDevicePicker
+        );
+
+        section(settingsPage, "화면 테마");
+
+        RadioGroup themes =
+            new RadioGroup(this);
+
+        themes.setOrientation(RadioGroup.VERTICAL);
+
+        settingsPage.addView(themes);
+
+        RadioButton light =
+            new RadioButton(this);
+
+        RadioButton darkButton =
+            new RadioButton(this);
+
+        light.setText("라이트 모드");
+        darkButton.setText("다크 모드");
+
+        light.setTextColor(fg());
+        darkButton.setTextColor(fg());
+
+        light.setId(1001);
+        darkButton.setId(1002);
+
+        themes.addView(light);
+        themes.addView(darkButton);
+
+        if (dark) {
+            darkButton.setChecked(true);
+        } else {
+            light.setChecked(true);
+        }
+
+        themes.setOnCheckedChangeListener(
+            (group, id) -> {
+                boolean next = id == 1002;
+
+                if (next == dark) return;
+
+                dark = next;
+
+                prefs().edit()
+                    .putBoolean("dark_theme", dark)
+                    .apply();
+
+                buildMainPage();
+                showSettingsPage();
+            }
+        );
+
+        TextView note = text(
+            "선택한 테마, 조명 색상, 밝기와 " +
+            "모드 속도는 앱을 종료해도 저장됩니다. " +
+            "이전에 등록한 차량은 앱 실행 시 " +
+            "자동 연결합니다.",
+            13,
+            muted()
+        );
+
+        note.setPadding(
+            0, dp(14), 0, 0
+        );
+
+        settingsPage.addView(note);
+
+        section(settingsPage, "고급 설정");
+
+        button(
+            settingsPage,
+            "개발자 모드",
+            this::showDeveloperPassword
+        );
+
+        updateStatusViews();
+    }
+
+    // 개발자 모드 비밀번호
+    private void showDeveloperPassword() {
+        EditText input = new EditText(this);
+
+        input.setSingleLine(true);
+
+        input.setInputType(
+            InputType.TYPE_CLASS_NUMBER |
+            InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        );
+
+        LinearLayout wrap =
+            new LinearLayout(this);
+
+        wrap.setPadding(
+            dp(22), 0, dp(22), 0
+        );
+
+        wrap.addView(
+            input,
+            new LinearLayout.LayoutParams(
+                -1, -2
+            )
+        );
+
+        new AlertDialog.Builder(this)
+            .setTitle("개발자 모드 비밀번호")
+            .setView(wrap)
+            .setPositiveButton(
+                "확인",
+                (dialog, which) -> {
+                    if ("8884".equals(
+                        input.getText().toString()
+                    )) {
+                        showDeveloperPage();
+                    } else {
+                        toast("비밀번호가 올바르지 않습니다");
+                    }
+                }
+            )
+            .setNegativeButton("취소", null)
+            .show();
+    }
+
+    // 개발자 모드
+    private void buildDeveloperPage() {
+        developerPage = column();
+
+        LinearLayout header =
+            new LinearLayout(this);
+
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
+        developerPage.addView(header);
+
+        IconView back =
+            new IconView(this, false, true);
+
+        header.addView(
+            back,
+            new LinearLayout.LayoutParams(
+                dp(42), dp(50)
+            )
+        );
+
+        back.setOnClickListener(
+            v -> showSettingsPage()
+        );
+
+        header.addView(
+            text("개발자 모드", 24, fg())
+        );
+
+        section(
+            developerPage,
+            "순차 점등 실행 방식"
+        );
+
+        developerPage.addView(
+            text(
+                "컨트롤러 방식은 앱 종료 후에도 효과가 " +
+                "유지될 수 있습니다. 스마트폰 방식은 " +
+                "앱 실행 및 BLE 연결이 필요합니다.",
+                13,
+                muted()
+            )
+        );
+
+        RadioGroup engine =
+            new RadioGroup(this);
+
+        engine.setOrientation(RadioGroup.VERTICAL);
+
+        developerPage.addView(engine);
+
+        RadioButton nativeMode =
+            new RadioButton(this);
+
+        RadioButton phoneMode =
+            new RadioButton(this);
+
+        nativeMode.setText(
+            "컨트롤러 자체 실행 (v0.9)"
+        );
+
+        phoneMode.setText(
+            "스마트폰 직접 실행 (느린 속도 지원)"
+        );
+
+        nativeMode.setTextColor(fg());
+        phoneMode.setTextColor(fg());
+
+        nativeMode.setId(3001);
+        phoneMode.setId(3002);
+
+        engine.addView(nativeMode);
+        engine.addView(phoneMode);
+
+        if (phoneSequential) {
+            phoneMode.setChecked(true);
+        } else {
+            nativeMode.setChecked(true);
+        }
+
+        engine.setOnCheckedChangeListener(
+            (group, id) -> {
+                boolean next = id == 3002;
+
+                if (next == phoneSequential) return;
+
+                phoneSequential = next;
+
+                prefs().edit()
+                    .putBoolean(
+                        "phone_sequential",
+                        phoneSequential
+                    )
+                    .apply();
+
+                if (modeRunning && selectedMode == 0) {
+                    if (connected) {
+                        sendModeCommand();
+                    } else {
+                        stopModeLocal();
+                    }
+                }
+
+                toast(
+                    phoneSequential
+                        ? "스마트폰 직접 실행 선택"
+                        : "컨트롤러 자체 실행 선택"
+                );
+            }
+        );
+
+        section(
+            developerPage,
+            "원시 속도값 테스트"
+        );
+
+        developerPage.addView(
+            text(
+                "실험용: 0~255. 기존 속도 슬라이더는 " +
+                "1~100을 사용합니다. 컨트롤러의 실제 " +
+                "지원 범위는 확인되지 않았습니다.",
+                13,
+                muted()
+            )
+        );
+
+        SeekBar rawBar =
+            new SeekBar(this);
+
+        rawBar.setMax(255);
+        rawBar.setProgress(modeSpeed);
+
+        developerPage.addView(rawBar);
+
+        TextView rawLabel = text(
+            "원시값: " + rawBar.getProgress(),
+            15,
+            fg()
+        );
+
+        developerPage.addView(rawLabel);
+
+        rawBar.setOnSeekBarChangeListener(
+            new SeekBar.OnSeekBarChangeListener() {
+
+            @Override
+            public void onProgressChanged(
+                SeekBar bar,
+                int value,
+                boolean fromUser
+            ) {
+                rawLabel.setText(
+                    "원시값: " + value
+                );
+            }
+
+            @Override
+            public void onStartTrackingTouch(
+                SeekBar bar
+            ) {}
+
+            @Override
+            public void onStopTrackingTouch(
+                SeekBar bar
+            ) {}
+        });
+
+        button(
+            developerPage,
+            "원시 속도값 전송",
+            () -> {
+                if (!connected) {
+                    toast("차량을 먼저 연결하세요");
+                    return;
+                }
+
+                send(
+                    rawSpeedPacket(
+                        rawBar.getProgress()
+                    )
+                );
+            }
+        );
+
+        section(
+            developerPage,
+            "HEX 명령 직접 전송"
+        );
+
+        developerPage.addView(
+            text(
+                "공백 없이 16진수로 입력하거나 " +
+                "바이트 사이에 공백을 넣을 수 있습니다. " +
+                "잘못된 명령은 조명 상태를 바꿀 수 있습니다.",
+                13,
+                muted()
+            )
+        );
+
+        EditText hexInput =
+            new EditText(this);
+
+        hexInput.setSingleLine(false);
+        hexInput.setMinLines(2);
+
+        hexInput.setText(
+            "7BFF0351FFFFFFFFBF"
+        );
+
+        hexInput.setTextColor(fg());
+
+        hexInput.setInputType(
+            InputType.TYPE_CLASS_TEXT |
+            InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        );
+
+        developerPage.addView(
+            hexInput,
+            new LinearLayout.LayoutParams(
+                -1, -2
+            )
+        );
+
+        button(
+            developerPage,
+            "HEX 전송",
+            () -> {
+                if (!connected) {
+                    toast("차량을 먼저 연결하세요");
+                    return;
+                }
+
+                String value =
+                    hexInput.getText()
+                        .toString()
+                        .replaceAll("\\s+", "");
+
+                if (value.isEmpty() ||
+                    (value.length() % 2) != 0 ||
+                    !value.matches("[0-9a-fA-F]+")) {
+
+                    toast("올바른 HEX 값을 입력하세요");
+                    return;
+                }
+
+                send(hex(value));
+            }
+        );
+
+        section(
+            developerPage,
+            "빠른 명령 테스트"
+        );
+
+        button(
+            developerPage,
+            "순차 점등 명령 전송",
+            () -> sendTest(SEQUENTIAL)
+        );
+
+        button(
+            developerPage,
+            "무지개 순환 명령 전송",
+            () -> sendTest(RAINBOW)
+        );
+
+        button(
+            developerPage,
+            "현재 RGB 고정",
+            () -> sendTest(
+                rgbPacket(r, g, b)
+            )
+        );
+
+        section(
+            developerPage,
+            "BLE 전송 로그"
+        );
+
+        developerLog = text(
+            logBuffer.length() == 0
+                ? "전송 기록 없음"
+                : logBuffer.toString(),
+            12,
+            muted()
+        );
+
+        developerLog.setTextIsSelectable(true);
+
+        developerPage.addView(developerLog);
+
+        button(
+            developerPage,
+            "로그 지우기",
+            () -> {
+                logBuffer.setLength(0);
+                developerLog.setText("전송 기록 없음");
+            }
+        );
+    }
+
+    private void sendTest(byte[] packet) {
+        if (!connected) {
+            toast("차량을 먼저 연결하세요");
+            return;
+        }
+
+        send(packet);
+    }
+
+    private void log(String message) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> log(message));
+            return;
+        }
+
+        String line = String.format(
+            Locale.US,
+            "%tT  %s\n",
+            new Date(),
+            message
+        );
+
+        logBuffer.append(line);
+
+        if (logBuffer.length() > 8000) {
+            logBuffer.delete(
+                0,
+                logBuffer.length() - 6000
+            );
+        }
+
+        if (developerVisible && developerLog != null) {
+            developerLog.setText(logBuffer.toString());
+        }
     }
 
     private void toast(String message) {
@@ -433,2289 +2052,411 @@ public class MainActivity extends Activity {
         ).show();
     }
 
-    // ==============================
-    // PAGE STRUCTURE
-    // ==============================
-
-    private void buildPage() {
-        root = column();
-        root.setBackgroundColor(backgroundColor());
-
-        setContentView(root);
-
-        buildHeader();
-
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-
-        content = column();
-
-        content.setPadding(
-            dp(18), dp(18),
-            dp(18), dp(24)
-        );
-
-        scroll.addView(content);
-
-        root.addView(
-            scroll,
-            new LinearLayout.LayoutParams(
-                -1, 0, 1
-            )
-        );
-
-        switch (currentPage) {
-            case 0:
-                buildColorPage();
-                break;
-
-            case 1:
-                buildModePage();
-                break;
-
-            case 2:
-                buildSettingsPage();
-                break;
-
-            case 3:
-                buildDeveloperPage();
-                break;
-        }
-
-        if (currentPage == 0 || currentPage == 1) {
-            buildBottomNavigation();
-        }
+    private void setStatus(String value) {
+        connectionText = value;
+        updateStatusViews();
     }
 
-    private void buildHeader() {
-        LinearLayout header = row();
-
-        header.setPadding(
-            dp(18), dp(16),
-            dp(18), dp(12)
-        );
-
-        if (currentPage >= 2) {
-            TextView back = text("‹", 32, false);
-            back.setPadding(0, 0, dp(18), 0);
-
-            back.setOnClickListener(v -> {
-                currentPage =
-                    currentPage == 3 ? 2 : 0;
-
-                buildPage();
-            });
-
-            header.addView(back);
-        }
-
-        String title;
-
-        if (currentPage == 2) {
-            title = "설정";
-        } else if (currentPage == 3) {
-            title = "개발자 모드";
-        } else {
-            title = "엠비언트 설정";
-        }
-
-        TextView name = text(title, 22, true);
-
-        header.addView(
-            name,
-            new LinearLayout.LayoutParams(
-                0, -2, 1
-            )
-        );
-
-        if (currentPage <= 1) {
-            TextView settings = text("⚙", 25, false);
-
-            settings.setPadding(
-                dp(12), 0, dp(12), 0
-            );
-
-            settings.setOnClickListener(v -> {
-                currentPage = 2;
-                buildPage();
-            });
-
-            header.addView(settings);
-
-            TextView power = text(
-                powerOn ? "⏻" : "○",
-                27,
-                true
-            );
-
-            power.setTextColor(
-                powerOn
-                    ? accentColor()
-                    : secondaryColor()
-            );
-
-            power.setOnClickListener(v -> togglePower());
-
-            header.addView(power);
-        }
-
-        root.addView(header);
-
-        statusText = text("", 12, false);
-        statusText.setTextColor(secondaryColor());
-
-        statusText.setPadding(
-            dp(18), 0, dp(18), dp(10)
-        );
-
-        root.addView(statusText);
-
-        updateStatus();
-    }
-
-    private void updateStatus() {
-        if (statusText == null) return;
-
-        String state;
-
-        if (connected) {
-            state = "● 연결됨";
-        } else if (connecting) {
-            state = "◌ 연결 중";
-        } else {
-            state = "○ 연결 안 됨";
-        }
-
-        if (!deviceName.isEmpty()) {
-            state += " · " + deviceName;
-        }
-
-        statusText.setText(state);
-    }
-
-    private void buildBottomNavigation() {
-        LinearLayout nav = row();
-
-        nav.setPadding(
-            dp(18), dp(8),
-            dp(18), dp(12)
-        );
-
-        Button colors = button("색상");
-        Button modes = button("모드");
-
-        if (currentPage != 0) {
-            colors = secondaryButton("색상");
-        }
-
-        if (currentPage != 1) {
-            modes = secondaryButton("모드");
-        }
-
-        colors.setOnClickListener(v -> {
-            currentPage = 0;
-            buildPage();
-        });
-
-        modes.setOnClickListener(v -> {
-            currentPage = 1;
-            buildPage();
-        });
-
-        LinearLayout.LayoutParams p =
-            new LinearLayout.LayoutParams(
-                0, dp(50), 1
-            );
-
-        p.rightMargin = dp(6);
-
-        nav.addView(colors, p);
-
-        LinearLayout.LayoutParams q =
-            new LinearLayout.LayoutParams(
-                0, dp(50), 1
-            );
-
-        q.leftMargin = dp(6);
-
-        nav.addView(modes, q);
-
-        root.addView(nav);
-    }
-
-    // ==============================
-    // COLOR PAGE
-    // ==============================
-
-    private void buildColorPage() {
-        LinearLayout colorCard = card();
-
-        addTitle(colorCard, "색상 선택");
-
-        ColorWheel wheel = new ColorWheel(this);
-
-        LinearLayout.LayoutParams wheelParams =
-            new LinearLayout.LayoutParams(
-                -1, dp(270)
-            );
-
-        colorCard.addView(wheel, wheelParams);
-
-        addSpace(colorCard, 12);
-
-        View preview = new View(this);
-
-        preview.setBackground(
-            rounded(
-                Color.rgb(red, green, blue),
-                12
-            )
-        );
-
-        colorCard.addView(
-            preview,
-            new LinearLayout.LayoutParams(
-                -1, dp(38)
-            )
-        );
-
-        wheel.setOnColorSelectedListener(color -> {
-            red = Color.red(color);
-            green = Color.green(color);
-            blue = Color.blue(color);
-
-            saveSettings();
-            applyColor();
-
-            preview.setBackground(
-                rounded(color, 12)
-            );
-        });
-
-        addCard(content, colorCard);
-
-        buildPresets();
-
-        LinearLayout rgbCard = card();
-        addTitle(rgbCard, "RGB 조절");
-
-        addRgbSlider(rgbCard, "R", red, 0);
-        addRgbSlider(rgbCard, "G", green, 1);
-        addRgbSlider(rgbCard, "B", blue, 2);
-
-        addCard(content, rgbCard);
-
-        buildBrightnessCard();
-    }
-
-    private void buildPresets() {
-        LinearLayout presetCard = card();
-
-        addTitle(presetCard, "즐겨찾기 색상");
-
-        LinearLayout items = row();
-
-        for (int i = 0; i < presets.length; i++) {
-            final int index = i;
-
-            View swatch = new View(this);
-
-            swatch.setBackground(
-                rounded(presets[i], 50)
-            );
-
-            LinearLayout.LayoutParams p =
-                new LinearLayout.LayoutParams(
-                    0, dp(43), 1
-                );
-
-            p.leftMargin = dp(3);
-            p.rightMargin = dp(3);
-
-            items.addView(swatch, p);
-
-            swatch.setOnClickListener(v -> {
-                int c = presets[index];
-
-                red = Color.red(c);
-                green = Color.green(c);
-                blue = Color.blue(c);
-
-                saveSettings();
-                applyColor();
-
-                buildPage();
-            });
-
-            swatch.setOnLongClickListener(v -> {
-                presets[index] =
-                    Color.rgb(red, green, blue);
-
-                saveSettings();
-
-                toast("즐겨찾기 색상이 저장되었습니다.");
-
-                buildPage();
-
-                return true;
-            });
-        }
-
-        presetCard.addView(items);
-
-        addSpace(presetCard, 10);
-
-        addDescription(
-            presetCard,
-            "짧게 누르면 적용, 길게 누르면 현재 색상을 저장합니다."
-        );
-
-        addCard(content, presetCard);
-    }
-
-    private void addRgbSlider(
-        LinearLayout parent,
-        String label,
-        int value,
-        int channel
-    ) {
-        TextView valueText = text(
-            label + "  " + value,
-            14,
-            true
-        );
-
-        parent.addView(valueText);
-
-        SeekBar bar = new SeekBar(this);
-        bar.setMax(255);
-        bar.setProgress(value);
-
-        parent.addView(bar);
-
-        bar.setOnSeekBarChangeListener(
-            new SimpleSeekListener() {
-                @Override
-                public void onProgressChanged(
-                    SeekBar seekBar,
-                    int progress,
-                    boolean fromUser
-                ) {
-                    if (!fromUser) return;
-
-                    if (channel == 0) red = progress;
-                    if (channel == 1) green = progress;
-                    if (channel == 2) blue = progress;
-
-                    valueText.setText(
-                        label + "  " + progress
-                    );
-
-                    saveSettings();
-                    applyColor();
-                }
-            }
-        );
-    }
-
-    private void buildBrightnessCard() {
-        LinearLayout brightnessCard = card();
-
-        addTitle(brightnessCard, "밝기");
-
-        TextView value = text(
-            brightness + "%",
-            14,
-            true
-        );
-
-        brightnessCard.addView(value);
-
-        SeekBar bar = new SeekBar(this);
-
-        bar.setMax(100);
-        bar.setProgress(brightness);
-
-        brightnessCard.addView(bar);
-
-        bar.setOnSeekBarChangeListener(
-            new SimpleSeekListener() {
-                @Override
-                public void onProgressChanged(
-                    SeekBar seekBar,
-                    int progress,
-                    boolean fromUser
-                ) {
-                    if (!fromUser) return;
-
-                    brightness = progress;
-
-                    value.setText(
-                        brightness + "%"
-                    );
-
-                    saveSettings();
-                    applyBrightness();
-                }
-            }
-        );
-
-        addCard(content, brightnessCard);
-    }
-
-    // ==============================
-    // MODE PAGE
-    // ==============================
-
-    private void buildModePage() {
-        LinearLayout modeCard = card();
-
-        addTitle(modeCard, "조명 효과");
-
-        RadioGroup group = new RadioGroup(this);
-        group.setOrientation(
-            RadioGroup.VERTICAL
-        );
-
-        RadioButton sequential =
-            new RadioButton(this);
-
-        sequential.setText("순차 점등");
-        sequential.setTextColor(textColor());
-        sequential.setTextSize(16);
-
-        RadioButton rainbow =
-            new RadioButton(this);
-
-        rainbow.setText("무지개 순환");
-        rainbow.setTextColor(textColor());
-        rainbow.setTextSize(16);
-
-        group.addView(sequential);
-        group.addView(rainbow);
-
-        if (selectedMode == 0) {
-            sequential.setChecked(true);
-        } else {
-            rainbow.setChecked(true);
-        }
-
-        group.setOnCheckedChangeListener(
-            (g, checkedId) -> {
-                int newMode =
-                    sequential.isChecked() ? 0 : 1;
-
-                if (newMode == selectedMode) return;
-
-                boolean restart = modeRunning;
-
-                if (restart) {
-                    stopMode();
-                }
-
-                selectedMode = newMode;
-                saveSettings();
-
-                if (restart) {
-                    startMode();
-                }
-
-                buildPage();
-            }
-        );
-
-        modeCard.addView(group);
-
-        addSpace(modeCard, 14);
-
-        modeStateText = text(
-            modeRunning ? "실행 중" : "중지됨",
-            13,
-            false
-        );
-
-        modeStateText.setTextColor(
-            secondaryColor()
-        );
-
-        modeCard.addView(modeStateText);
-
-        addSpace(modeCard, 12);
-
-        Button modeButton = button(
-            modeRunning
-                ? "조명 효과 중지"
-                : "조명 효과 시작"
-        );
-
-        modeButton.setOnClickListener(v -> {
-            if (modeRunning) {
-                stopMode();
-            } else {
-                startMode();
-            }
-
-            buildPage();
-        });
-
-        modeCard.addView(modeButton);
-
-        addCard(content, modeCard);
-
-        LinearLayout speedCard = card();
-
-        addTitle(speedCard, "효과 속도");
-
-        speedValue = text(
-            speed + "%",
-            15,
-            true
-        );
-
-        speedCard.addView(speedValue);
-
-        speedBar = new SeekBar(this);
-        speedBar.setMax(99);
-        speedBar.setProgress(speed - 1);
-
-        speedCard.addView(speedBar);
-
-        LinearLayout labels = row();
-
-        TextView slow = text(
-            "느리게",
-            12,
-            false
-        );
-
-        TextView fast = text(
-            "빠르게",
-            12,
-            false
-        );
-
-        slow.setTextColor(secondaryColor());
-        fast.setTextColor(secondaryColor());
-
-        labels.addView(
-            slow,
-            new LinearLayout.LayoutParams(
-                0, -2, 1
-            )
-        );
-
-        labels.addView(fast);
-
-        speedCard.addView(labels);
-
-        speedBar.setOnSeekBarChangeListener(
-            new SimpleSeekListener() {
-                @Override
-                public void onProgressChanged(
-                    SeekBar seekBar,
-                    int progress,
-                    boolean fromUser
-                ) {
-                    if (!fromUser) return;
-
-                    speed = progress + 1;
-
-                    speedValue.setText(
-                        speed + "%"
-                    );
-
-                    saveSettings();
-                }
-
-                @Override
-                public void onStopTrackingTouch(
-                    SeekBar seekBar
-                ) {
-                    if (!modeRunning) return;
-
-                    if (isPhoneSequential()) {
-                        restartPhoneAnimation();
-                    } else {
-                        send(speedPacket(speed));
-                    }
-                }
-            }
-        );
-
-        addCard(content, speedCard);
-
-        LinearLayout info = card();
-
-        addTitle(info, "현재 실행 방식");
-
-        if (selectedMode == 1) {
-            addDescription(
-                info,
-                "무지개 순환 · 컨트롤러 자체 제어"
-            );
-        } else if (sequentialEngine == 0) {
-            addDescription(
-                info,
-                "순차 점등 · 컨트롤러 자체 제어"
-            );
-        } else {
-            addDescription(
-                info,
-                "순차 점등 · 스마트폰 직접 제어"
+    private void updateStatusViews() {
+        if (mainStatus != null) {
+            mainStatus.setText(
+                connectionText +
+                (connected && !savedAddress.isEmpty()
+                    ? " · " + savedAddress
+                    : "")
             );
         }
 
-        addCard(content, info);
+        if (settingsStatus != null) {
+            settingsStatus.setText(connectionText);
 
-        buildBrightnessCard();
-    }
-
-    private boolean isPhoneSequential() {
-        return selectedMode == 0
-            && sequentialEngine == 1;
-    }
-
-    // ==============================
-    // EFFECT CONTROL
-    // ==============================
-
-    private void startMode() {
-        if (!connected) {
-            toast("블루투스 장치를 먼저 연결하세요.");
-            return;
-        }
-
-        stopPhoneAnimation();
-
-        modeRunning = true;
-
-        commandGeneration++;
-        clearSendQueue();
-
-        if (isPhoneSequential()) {
-            startPhoneAnimation();
-        } else {
-            sendModeCommand();
-        }
-    }
-
-    private void stopMode() {
-        modeRunning = false;
-
-        commandGeneration++;
-
-        stopPhoneAnimation();
-        clearSendQueue();
-
-        // Freeze the light at the selected RGB color.
-        if (connected) {
-            send(rgbPacket(red, green, blue));
-        }
-    }
-
-    private void sendModeCommand() {
-        if (!connected) return;
-
-        if (selectedMode == 0) {
-            send(SEQUENTIAL);
-        } else {
-            send(RAINBOW);
-        }
-
-        final int generation = commandGeneration;
-
-        handler.postDelayed(() -> {
-            if (
-                generation == commandGeneration
-                && modeRunning
-                && connected
-                && !isPhoneSequential()
-            ) {
-                send(speedPacket(speed));
-            }
-        }, 240);
-    }
-
-    // ==============================
-    // PHONE ENGINE (v0.7 STYLE)
-    // ==============================
-
-    private static double smoothCycleSeconds(
-        int value
-    ) {
-        double fraction =
-            Math.max(0, Math.min(100, value))
-            / 100.0;
-
-        return 3600.0 *
-            Math.pow(
-                5.0 / 3600.0,
-                fraction
-            );
-    }
-
-    private void startPhoneAnimation() {
-        if (!connected) return;
-
-        stopPhoneAnimation();
-
-        phoneAnimationActive = true;
-        phoneAnimationStart =
-            SystemClock.elapsedRealtime();
-
-        final int generation = commandGeneration;
-
-        phoneAnimation = new Runnable() {
-            @Override
-            public void run() {
-                if (
-                    !phoneAnimationActive
-                    || !modeRunning
-                    || !connected
-                    || !isPhoneSequential()
-                    || generation != commandGeneration
-                ) {
-                    return;
-                }
-
-                double elapsed =
-                    (
-                        SystemClock.elapsedRealtime()
-                        - phoneAnimationStart
-                    ) / 1000.0;
-
-                double cycle =
-                    smoothCycleSeconds(speed);
-
-                float hue =
-                    (float) (
-                        (elapsed / cycle * 360.0)
-                        % 360.0
-                    );
-
-                int color = Color.HSVToColor(
-                    new float[] {
-                        hue, 1f, 1f
-                    }
-                );
-
-                send(
-                    rgbPacket(
-                        Color.red(color),
-                        Color.green(color),
-                        Color.blue(color)
-                    )
-                );
-
-                handler.postDelayed(this, 100);
-            }
-        };
-
-        handler.post(phoneAnimation);
-    }
-
-    private void stopPhoneAnimation() {
-        phoneAnimationActive = false;
-
-        if (phoneAnimation != null) {
-            handler.removeCallbacks(
-                phoneAnimation
-            );
-
-            phoneAnimation = null;
-        }
-    }
-
-    private void restartPhoneAnimation() {
-        if (
-            modeRunning
-            && isPhoneSequential()
-            && connected
-        ) {
-            startPhoneAnimation();
-        }
-    }
-
-    // ==============================
-    // COLOR / POWER COMMANDS
-    // ==============================
-
-    private void applyColor() {
-        if (!connected) return;
-
-        if (modeRunning) {
-            stopMode();
-        }
-
-        send(
-            rgbPacket(red, green, blue)
-        );
-    }
-
-    private void togglePower() {
-        powerOn = !powerOn;
-        saveSettings();
-
-        if (!powerOn) {
-            modeRunning = false;
-            commandGeneration++;
-            stopPhoneAnimation();
-            clearSendQueue();
-            send(OFF);
-        } else {
-            send(ON);
-
-            handler.postDelayed(
-                () -> {
-                    if (powerOn && connected) {
-                        send(
-                            rgbPacket(
-                                red, green, blue
-                            )
-                        );
-                    }
-                },
-                240
+            settingsStatus.setTextColor(
+                connected ? accent() : muted()
             );
         }
 
-        buildPage();
-    }
-
-    private void applyBrightness() {
-        if (!connected) return;
-
-        // The exact brightness protocol can differ
-        // between LED controllers. This command uses
-        // the RGB packet's brightness scaling.
-        // Native running modes are left untouched.
-
-        if (!modeRunning) {
-            send(
-                rgbPacket(
-                    red, green, blue
-                )
+        if (settingsDevice != null) {
+            settingsDevice.setText(
+                "기기: " +
+                (deviceName.isEmpty()
+                    ? "이름 확인 안 됨"
+                    : deviceName)
+                + "\n주소: " +
+                (savedAddress.isEmpty()
+                    ? "등록되지 않음"
+                    : savedAddress)
             );
         }
     }
 
-    private byte[] rgbPacket(
-        int r,
-        int g,
-        int b
-    ) {
-        int rr = Math.round(
-            clamp(r, 0, 255)
-            * brightness / 100f
-        );
-
-        int gg = Math.round(
-            clamp(g, 0, 255)
-            * brightness / 100f
-        );
-
-        int bb = Math.round(
-            clamp(b, 0, 255)
-            * brightness / 100f
-        );
-
-        return new byte[] {
-            0x7B,
-            (byte) 0xFF,
-            0x07,
-            0x05,
-            (byte) rr,
-            (byte) gg,
-            (byte) bb,
-            (byte) 0xFF,
-            (byte) 0xBF
-        };
-    }
-
-    private static byte[] speedPacket(
-        int value
-    ) {
-        int v = clamp(value, 0, 255);
-
-        return new byte[] {
-            0x7B,
-            (byte) 0xFF,
-            0x02,
-            (byte) v,
-            (byte) 0xFF,
-            0x00,
-            (byte) 0xFF,
-            (byte) 0xFF,
-            (byte) 0xBF
-        };
-    }
-
-    private static int clamp(
-        int v,
-        int min,
-        int max
-    ) {
-        return Math.max(
-            min,
-            Math.min(max, v)
-        );
-    }
-
-    // ==============================
-    // SETTINGS PAGE
-    // ==============================
-
-    private void buildSettingsPage() {
-        LinearLayout bluetoothCard = card();
-
-        addTitle(
-            bluetoothCard,
-            "블루투스 연결"
-        );
-
-        addDescription(
-            bluetoothCard,
-            connected
-                ? "연결된 장치: " + deviceName
-                : "현재 연결된 장치가 없습니다."
-        );
-
-        addSpace(bluetoothCard, 12);
-
-        Button scanButton =
-            button("블루투스 장치 검색");
-
-        scanButton.setOnClickListener(
-            v -> startScan()
-        );
-
-        bluetoothCard.addView(scanButton);
-
-        addSpace(bluetoothCard, 8);
-
-        Button disconnectButton =
-            secondaryButton("연결 해제");
-
-        disconnectButton.setOnClickListener(v -> {
-            deviceAddress = "";
-            deviceName = "";
-
-            saveSettings();
-
-            disconnectGatt();
-
-            buildPage();
-        });
-
-        bluetoothCard.addView(disconnectButton);
-
-        addSpace(bluetoothCard, 12);
-
-        Switch reconnectSwitch =
-            new Switch(this);
-
-        reconnectSwitch.setText("자동 재연결");
-        reconnectSwitch.setTextColor(textColor());
-
-        reconnectSwitch.setChecked(
-            autoReconnect
-        );
-
-        reconnectSwitch.setOnCheckedChangeListener(
-            (buttonView, checked) -> {
-                autoReconnect = checked;
-                saveSettings();
-            }
-        );
-
-        bluetoothCard.addView(reconnectSwitch);
-
-        addCard(content, bluetoothCard);
-
-        LinearLayout themeCard = card();
-
-        addTitle(themeCard, "화면 설정");
-
-        Switch themeSwitch = new Switch(this);
-
-        themeSwitch.setText("다크 모드");
-        themeSwitch.setTextColor(textColor());
-        themeSwitch.setChecked(darkTheme);
-
-        themeSwitch.setOnCheckedChangeListener(
-            (buttonView, checked) -> {
-                darkTheme = checked;
-                saveSettings();
-                buildPage();
-            }
-        );
-
-        themeCard.addView(themeSwitch);
-
-        addCard(content, themeCard);
-
-        // Developer mode entry
-        LinearLayout developerCard = card();
-
-        addTitle(
-            developerCard,
-            "개발자 설정"
-        );
-
-        addDescription(
-            developerCard,
-            "BLE 명령 분석, 속도 테스트 및 순차 점등 엔진 설정"
-        );
-
-        addSpace(developerCard, 12);
-
-        Button developerButton =
-            secondaryButton(
-                "🔒 개발자 모드"
-            );
-
-        developerButton.setOnClickListener(
-            v -> showDeveloperPassword()
-        );
-
-        developerCard.addView(
-            developerButton
-        );
-
-        addCard(content, developerCard);
-    }
-
-    // ==============================
-    // DEVELOPER AUTHENTICATION
-    // ==============================
-
-    private void showDeveloperPassword() {
-        final EditText password =
-            new EditText(this);
-
-        password.setSingleLine(true);
-        password.setHint("비밀번호");
-
-        password.setInputType(
-            android.text.InputType
-                .TYPE_CLASS_NUMBER
-            |
-            android.text.InputType
-                .TYPE_NUMBER_VARIATION_PASSWORD
-        );
-
-        LinearLayout wrapper = column();
-
-        wrapper.setPadding(
-            dp(22), dp(8),
-            dp(22), 0
-        );
-
-        wrapper.addView(password);
-
-        AlertDialog dialog =
-            new AlertDialog.Builder(this)
-                .setTitle("개발자 모드 인증")
-                .setMessage(
-                    "비밀번호를 입력하세요."
-                )
-                .setView(wrapper)
-                .setNegativeButton(
-                    "취소", null
-                )
-                .setPositiveButton(
-                    "확인", null
-                )
-                .create();
-
-        dialog.setOnShowListener(d -> {
-            dialog.getButton(
-                AlertDialog.BUTTON_POSITIVE
-            ).setOnClickListener(v -> {
-                String input =
-                    password.getText()
-                        .toString().trim();
-
-                if (PASSWORD.equals(input)) {
-                    dialog.dismiss();
-
-                    currentPage = 3;
-                    buildPage();
-                } else {
-                    password.setText("");
-                    password.setError(
-                        "비밀번호가 올바르지 않습니다."
-                    );
-                }
-            });
-        });
-
-        dialog.show();
-    }
-
-    // ==============================
-    // DEVELOPER PAGE
-    // ==============================
-
-    private void buildDeveloperPage() {
-        LinearLayout engineCard = card();
-
-        addTitle(
-            engineCard,
-            "순차 점등 구현 방식"
-        );
-
-        addDescription(
-            engineCard,
-            "일반 모드 페이지의 순차 점등에 적용할 엔진을 선택합니다."
-        );
-
-        addSpace(engineCard, 14);
-
-        RadioGroup engineGroup =
-            new RadioGroup(this);
-
-        RadioButton controllerRadio =
-            new RadioButton(this);
-
-        controllerRadio.setText(
-            "컨트롤러 자체 제어 (v0.9)"
-        );
-
-        controllerRadio.setTextColor(
-            textColor()
-        );
-
-        RadioButton phoneRadio =
-            new RadioButton(this);
-
-        phoneRadio.setText(
-            "스마트폰 직접 제어 (v0.7)"
-        );
-
-        phoneRadio.setTextColor(
-            textColor()
-        );
-
-        engineGroup.addView(controllerRadio);
-        engineGroup.addView(phoneRadio);
-
-        if (sequentialEngine == 0) {
-            controllerRadio.setChecked(true);
-        } else {
-            phoneRadio.setChecked(true);
-        }
-
-        engineCard.addView(engineGroup);
-
-        addSpace(engineCard, 12);
-
-        TextView engineInfo = text(
-            "",
-            13,
-            false
-        );
-
-        engineInfo.setTextColor(
-            secondaryColor()
-        );
-
-        engineCard.addView(engineInfo);
-
-        updateEngineInfo(engineInfo);
-
-        engineGroup.setOnCheckedChangeListener(
-            (group, checkedId) -> {
-                int newEngine =
-                    controllerRadio.isChecked()
-                        ? 0 : 1;
-
-                if (
-                    newEngine == sequentialEngine
-                ) {
-                    return;
-                }
-
-                boolean restart =
-                    modeRunning
-                    && selectedMode == 0;
-
-                if (restart) {
-                    stopMode();
-                }
-
-                sequentialEngine = newEngine;
-
-                saveSettings();
-
-                updateEngineInfo(engineInfo);
-
-                if (restart) {
-                    startMode();
-                }
-
-                toast(
-                    "순차 점등 방식이 변경되었습니다."
-                );
-            }
-        );
-
-        addCard(content, engineCard);
-
-        buildDeveloperSpeedTest();
-        buildDeveloperModeTests();
-        buildDeveloperHexSender();
-        buildDeveloperLogs();
-
-        LinearLayout warning = card();
-
-        addTitle(
-            warning,
-            "주의사항"
-        );
-
-        addDescription(
-            warning,
-            "스마트폰 직접 제어는 앱이 실행 중이고 BLE 연결이 유지되어야 작동합니다.\n\n" +
-            "원시 속도값 0~255는 모두 지원된다고 확인된 범위가 아닙니다.\n\n" +
-            "확인되지 않은 BLE 명령은 조명 동작에 영향을 줄 수 있습니다."
-        );
-
-        addCard(content, warning);
-    }
-
-    private void updateEngineInfo(
-        TextView view
-    ) {
-        if (sequentialEngine == 0) {
-            view.setText(
-                "컨트롤러가 직접 그라데이션을 실행합니다.\n" +
-                "앱을 종료해도 효과가 유지될 수 있습니다.\n" +
-                "최저 속도는 컨트롤러의 지원 범위에 따라 제한됩니다."
-            );
-        } else {
-            view.setText(
-                "스마트폰에서 색상을 계산해 BLE로 전송합니다.\n" +
-                "매우 느린 속도를 설정할 수 있습니다.\n" +
-                "앱 종료 또는 BLE 연결 해제 시 효과가 중단됩니다."
-            );
-        }
-    }
-
-    // ==============================
-    // DEVELOPER SPEED TEST
-    // ==============================
-
-    private void buildDeveloperSpeedTest() {
-        LinearLayout speedCard = card();
-
-        addTitle(
-            speedCard,
-            "BLE 속도 원시값 테스트"
-        );
-
-        addDescription(
-            speedCard,
-            "컨트롤러 자체 제어 방식에서 사용할 속도 명령을 직접 테스트합니다."
-        );
-
-        addSpace(speedCard, 14);
-
-        TextView value = text(
-            "원시값: " + developerSpeed,
-            16,
-            true
-        );
-
-        speedCard.addView(value);
-
-        SeekBar bar = new SeekBar(this);
-
-        bar.setMax(255);
-        bar.setProgress(developerSpeed);
-
-        speedCard.addView(bar);
-
-        TextView packetPreview = text(
-            bytesToHex(
-                speedPacket(developerSpeed)
-            ),
-            13,
-            false
-        );
-
-        packetPreview.setTextColor(
-            secondaryColor()
-        );
-
-        speedCard.addView(packetPreview);
-
-        bar.setOnSeekBarChangeListener(
-            new SimpleSeekListener() {
-                @Override
-                public void onProgressChanged(
-                    SeekBar seekBar,
-                    int progress,
-                    boolean fromUser
-                ) {
-                    developerSpeed = progress;
-
-                    value.setText(
-                        "원시값: " + progress
-                    );
-
-                    packetPreview.setText(
-                        bytesToHex(
-                            speedPacket(progress)
-                        )
-                    );
-                }
-            }
-        );
-
-        addSpace(speedCard, 10);
-
-        LinearLayout quick1 = row();
-
-        int[] firstValues = {
-            0, 1, 2, 5
-        };
-
-        for (int n : firstValues) {
-            Button b = secondaryButton(
-                String.valueOf(n)
-            );
-
-            quick1.addView(
-                b,
-                new LinearLayout.LayoutParams(
-                    0, dp(45), 1
-                )
-            );
-
-            b.setOnClickListener(v -> {
-                developerSpeed = n;
-                bar.setProgress(n);
-            });
-        }
-
-        speedCard.addView(quick1);
-
-        LinearLayout quick2 = row();
-
-        int[] secondValues = {
-            10, 50, 100, 255
-        };
-
-        for (int n : secondValues) {
-            Button b = secondaryButton(
-                String.valueOf(n)
-            );
-
-            quick2.addView(
-                b,
-                new LinearLayout.LayoutParams(
-                    0, dp(45), 1
-                )
-            );
-
-            b.setOnClickListener(v -> {
-                developerSpeed = n;
-                bar.setProgress(n);
-            });
-        }
-
-        speedCard.addView(quick2);
-
-        addSpace(speedCard, 12);
-
-        Button sendSpeed =
-            button("현재 속도 명령 전송");
-
-        sendSpeed.setOnClickListener(v -> {
-            if (!connected) {
-                toast("BLE 연결이 필요합니다.");
-                return;
-            }
-
-            byte[] packet =
-                speedPacket(developerSpeed);
-
-            send(packet);
-
-            toast(
-                "속도 원시값 "
-                + developerSpeed
-                + " 전송 요청"
-            );
-        });
-
-        speedCard.addView(sendSpeed);
-
-        addCard(content, speedCard);
-    }
-
-    // ==============================
-    // DEVELOPER MODE TESTS
-    // ==============================
-
-    private void buildDeveloperModeTests() {
-        LinearLayout testCard = card();
-
-        addTitle(
-            testCard,
-            "조명 효과 테스트"
-        );
-
-        Button sequential =
-            button("컨트롤러 순차 점등");
-
-        sequential.setOnClickListener(v -> {
-            stopPhoneAnimation();
-            commandGeneration++;
-            clearSendQueue();
-
-            selectedMode = 0;
-            sequentialEngine = 0;
-            modeRunning = true;
-
-            saveSettings();
-            sendModeCommand();
-
-            toast(
-                "컨트롤러 순차 점등 실행 요청"
-            );
-        });
-
-        testCard.addView(sequential);
-
-        addSpace(testCard, 8);
-
-        Button rainbow =
-            button("무지개 순환");
-
-        rainbow.setOnClickListener(v -> {
-            stopPhoneAnimation();
-            commandGeneration++;
-            clearSendQueue();
-
-            selectedMode = 1;
-            modeRunning = true;
-
-            saveSettings();
-            sendModeCommand();
-
-            toast(
-                "무지개 순환 실행 요청"
-            );
-        });
-
-        testCard.addView(rainbow);
-
-        addSpace(testCard, 8);
-
-        Button phone =
-            button("스마트폰 순차 점등");
-
-        phone.setOnClickListener(v -> {
-            stopPhoneAnimation();
-            commandGeneration++;
-            clearSendQueue();
-
-            selectedMode = 0;
-            sequentialEngine = 1;
-            modeRunning = true;
-
-            saveSettings();
-
-            if (connected) {
-                startPhoneAnimation();
-            } else {
-                modeRunning = false;
-                toast("BLE 연결이 필요합니다.");
-            }
-        });
-
-        testCard.addView(phone);
-
-        addSpace(testCard, 8);
-
-        Button stop =
-            secondaryButton("조명 효과 중지");
-
-        stop.setOnClickListener(v -> {
-            stopMode();
-            toast("조명 효과 중지 요청");
-        });
-
-        testCard.addView(stop);
-
-        addCard(content, testCard);
-    }
-
-    // ==============================
-    // DEVELOPER HEX SENDER
-    // ==============================
-
-    private void buildDeveloperHexSender() {
-        LinearLayout hexCard = card();
-
-        addTitle(
-            hexCard,
-            "BLE HEX 명령 직접 전송"
-        );
-
-        EditText hexInput =
-            new EditText(this);
-
-        hexInput.setSingleLine(false);
-        hexInput.setMinLines(2);
-
-        hexInput.setTextColor(textColor());
-
-        hexInput.setHint(
-            "7B FF 03 51 FF FF FF FF BF"
-        );
-
-        hexCard.addView(hexInput);
-
-        addSpace(hexCard, 10);
-
-        Button sendButton =
-            button("HEX 명령 전송");
-
-        sendButton.setOnClickListener(v -> {
-            String input =
-                hexInput.getText()
-                    .toString()
-                    .replaceAll("\\s+", "")
-                    .toUpperCase(Locale.US);
-
-            if (!input.matches(
-                "[0-9A-F]{18}"
-            )) {
-                toast(
-                    "9바이트 HEX 명령을 입력하세요."
-                );
-                return;
-            }
-
-            if (
-                !input.startsWith("7B")
-                || !input.endsWith("BF")
-            ) {
-                toast(
-                    "패킷 시작값 또는 종료값이 올바르지 않습니다."
-                );
-                return;
-            }
-
-            if (!connected) {
-                toast("BLE 연결이 필요합니다.");
-                return;
-            }
-
-            byte[] packet = hex(input);
-
-            new AlertDialog.Builder(this)
-                .setTitle("BLE 명령 전송")
-                .setMessage(
-                    "다음 명령을 전송할까요?\n\n"
-                    + bytesToHex(packet)
-                )
-                .setNegativeButton(
-                    "취소", null
-                )
-                .setPositiveButton(
-                    "전송",
-                    (dialog, which) -> {
-                        send(packet);
-                        toast("전송 요청 완료");
-                    }
-                )
-                .show();
-        });
-
-        hexCard.addView(sendButton);
-
-        addCard(content, hexCard);
-    }
-
-    // ==============================
-    // DEVELOPER LOGS
-    // ==============================
-
-    private void buildDeveloperLogs() {
-        LinearLayout logCard = card();
-
-        addTitle(
-            logCard,
-            "BLE 명령 기록"
-        );
-
-        TextView logs = text(
-            getLogText(),
-            12,
-            false
-        );
-
-        logs.setTextColor(
-            secondaryColor()
-        );
-
-        logCard.addView(logs);
-
-        addSpace(logCard, 12);
-
-        Button refresh =
-            secondaryButton("기록 새로고침");
-
-        refresh.setOnClickListener(
-            v -> logs.setText(getLogText())
-        );
-
-        logCard.addView(refresh);
-
-        addSpace(logCard, 8);
-
-        Button copy =
-            secondaryButton("기록 복사");
-
-        copy.setOnClickListener(v -> {
-            ClipboardManager clipboard =
-                (ClipboardManager)
-                    getSystemService(
-                        Context.CLIPBOARD_SERVICE
-                    );
-
-            if (clipboard != null) {
-                clipboard.setPrimaryClip(
-                    ClipData.newPlainText(
-                        "BLE Log",
-                        getLogText()
-                    )
-                );
-
-                toast("기록을 복사했습니다.");
-            }
-        });
-
-        logCard.addView(copy);
-
-        addSpace(logCard, 8);
-
-        Button clear =
-            secondaryButton("기록 삭제");
-
-        clear.setOnClickListener(v -> {
-            commandLogs.clear();
-            logs.setText(getLogText());
-        });
-
-        logCard.addView(clear);
-
-        addCard(content, logCard);
-    }
-
-    private String getLogText() {
-        if (commandLogs.isEmpty()) {
-            return "기록이 없습니다.";
-        }
-
-        StringBuilder sb =
-            new StringBuilder();
-
-        for (String log : commandLogs) {
-            sb.append(log).append("\n");
-        }
-
-        return sb.toString();
-    }
-
-    private void addLog(String message) {
-        String time =
-            new java.text.SimpleDateFormat(
-                "HH:mm:ss.SSS",
-                Locale.getDefault()
-            ).format(new Date());
-
-        commandLogs.add(
-            0,
-            "[" + time + "] " + message
-        );
-
-        while (commandLogs.size() > 100) {
-            commandLogs.remove(
-                commandLogs.size() - 1
-            );
-        }
-    }
-
-    // ==============================
-    // BLE PERMISSIONS
-    // ==============================
-
-    private boolean hasBluetoothPermissions() {
+    // BLE 권한
+    private boolean hasPermissions() {
         if (Build.VERSION.SDK_INT >= 31) {
-            return checkSelfPermission(
-                Manifest.permission.BLUETOOTH_SCAN
-            ) == PackageManager.PERMISSION_GRANTED
-            &&
-            checkSelfPermission(
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED;
+            return
+                checkSelfPermission(
+                    Manifest.permission.BLUETOOTH_SCAN
+                ) == PackageManager.PERMISSION_GRANTED
+                &&
+                checkSelfPermission(
+                    Manifest.permission.BLUETOOTH_CONNECT
+                ) == PackageManager.PERMISSION_GRANTED;
         }
 
-        if (Build.VERSION.SDK_INT >= 23) {
-            return checkSelfPermission(
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED;
-        }
-
-        return true;
+        return checkSelfPermission(
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED;
     }
 
-    private void requestBluetoothPermissions() {
-        if (hasBluetoothPermissions()) {
-            return;
-        }
-
+    private void requestNeededPermissions() {
         if (Build.VERSION.SDK_INT >= 31) {
             requestPermissions(
-                new String[] {
+                new String[]{
                     Manifest.permission.BLUETOOTH_SCAN,
                     Manifest.permission.BLUETOOTH_CONNECT
                 },
-                REQUEST_BLE
+                1
             );
-        } else if (Build.VERSION.SDK_INT >= 23) {
+        } else {
             requestPermissions(
-                new String[] {
+                new String[]{
                     Manifest.permission.ACCESS_FINE_LOCATION
                 },
-                REQUEST_BLE
+                1
             );
         }
     }
 
     @Override
     public void onRequestPermissionsResult(
-        int requestCode,
+        int code,
         String[] permissions,
-        int[] grantResults
+        int[] results
     ) {
         super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            grantResults
+            code, permissions, results
         );
 
-        if (requestCode == REQUEST_BLE) {
-            if (hasBluetoothPermissions()) {
-                toast(
-                    "블루투스 권한이 허용되었습니다."
-                );
-            } else {
-                toast(
-                    "블루투스 권한이 필요합니다."
-                );
-            }
+        if (hasPermissions()) {
+            startAuto();
+        } else {
+            setStatus("근처 기기 권한을 허용하세요");
         }
     }
 
-    // ==============================
-    // BLE SCANNING
-    // ==============================
+    // 자동 연결
+    private void startAuto() {
+        active = true;
 
-    private final ScanCallback scanCallback =
-        new ScanCallback() {
-            @Override
-            public void onScanResult(
-                int callbackType,
-                ScanResult result
-            ) {
-                BluetoothDevice device =
-                    result.getDevice();
-
-                if (device == null) return;
-
-                String address;
-
-                try {
-                    address = device.getAddress();
-                } catch (SecurityException e) {
-                    return;
-                }
-
-                if (address == null) return;
-
-                if (!foundDevices.containsKey(address)) {
-                    foundDevices.put(
-                        address,
-                        device
-                    );
-
-                    handler.post(
-                        () -> updateDeviceDialog()
-                    );
-                }
-            }
-
-            @Override
-            public void onScanFailed(
-                int errorCode
-            ) {
-                handler.post(() -> {
-                    scanning = false;
-
-                    addLog(
-                        "SCAN ERROR " + errorCode
-                    );
-
-                    toast(
-                        "BLE 검색 실패: " + errorCode
-                    );
-                });
-            }
-        };
-
-    private AlertDialog deviceDialog;
-    private LinearLayout deviceList;
-
-    private void startScan() {
-        if (!hasBluetoothPermissions()) {
-            requestBluetoothPermissions();
-            return;
-        }
-
-        if (
-            adapter == null
-            || !adapter.isEnabled()
-        ) {
-            toast(
-                "블루투스를 켜주세요."
+        if (savedAddress.isEmpty()) {
+            setStatus(
+                "기기 미등록 · 설정에서 차량을 선택하세요"
             );
+        } else {
+            scanSaved();
+        }
+    }
+
+    private void scanSaved() {
+        if (!active ||
+            choosing ||
+            scanning ||
+            connected ||
+            connecting ||
+            !hasPermissions()) {
             return;
         }
 
-        stopScan();
-
-        foundDevices.clear();
-
-        scanner =
-            adapter.getBluetoothLeScanner();
-
-        if (scanner == null) {
-            toast(
-                "BLE 스캐너를 사용할 수 없습니다."
-            );
+        if (savedAddress.isEmpty()) {
+            setStatus("기기 미등록");
             return;
         }
 
-        deviceList = column();
-
-        ScrollView scroll =
-            new ScrollView(this);
-
-        scroll.addView(deviceList);
-
-        deviceDialog =
-            new AlertDialog.Builder(this)
-                .setTitle("BLE 장치 검색")
-                .setView(scroll)
-                .setNegativeButton(
-                    "닫기",
-                    (dialog, which) -> stopScan()
-                )
-                .create();
-
-        deviceDialog.setOnDismissListener(
-            dialog -> stopScan()
-        );
-
-        deviceDialog.show();
+        if (adapter == null || !adapter.isEnabled()) {
+            setStatus("블루투스를 켜 주세요");
+            scheduleRetry();
+            return;
+        }
 
         try {
+            scanner =
+                adapter.getBluetoothLeScanner();
+
+            if (scanner == null) {
+                scheduleRetry();
+                return;
+            }
+
             scanner.startScan(scanCallback);
             scanning = true;
 
-            addLog("SCAN START");
+            setStatus("이전 차량 검색 중...");
 
-            updateDeviceDialog();
+            handler.removeCallbacks(timeoutTask);
 
             handler.postDelayed(
-                () -> stopScan(),
-                12000
+                timeoutTask, 10000
             );
         } catch (SecurityException e) {
-            toast(
-                "블루투스 권한 오류"
-            );
+            setStatus("블루투스 권한 오류");
         }
     }
 
-    private void updateDeviceDialog() {
-        if (
-            deviceList == null
-            || deviceDialog == null
-            || !deviceDialog.isShowing()
-        ) {
+    // 다른 차량 선택
+    private void startDevicePicker() {
+        if (!hasPermissions()) {
+            requestNeededPermissions();
             return;
         }
 
-        deviceList.removeAllViews();
-
-        if (foundDevices.isEmpty()) {
-            TextView waiting = text(
-                "장치를 검색하고 있습니다...",
-                14,
-                false
-            );
-
-            waiting.setPadding(
-                dp(18), dp(18),
-                dp(18), dp(18)
-            );
-
-            deviceList.addView(waiting);
+        if (adapter == null || !adapter.isEnabled()) {
+            setStatus("블루투스를 켜 주세요");
             return;
         }
 
-        for (
-            Map.Entry<String, BluetoothDevice> entry
-            : foundDevices.entrySet()
-        ) {
-            BluetoothDevice device =
-                entry.getValue();
+        disconnect();
 
-            String address =
-                entry.getKey();
+        active = true;
+        choosing = true;
 
-            String name = address;
-
-            try {
-                String n = device.getName();
-
-                if (
-                    n != null
-                    && !n.trim().isEmpty()
-                ) {
-                    name = n;
-                }
-            } catch (SecurityException ignored) {
-            }
-
-            final String finalName = name;
-
-            Button item =
-                secondaryButton(
-                    name + "\n" + address
-                );
-
-            item.setOnClickListener(v -> {
-                if (
-                    deviceDialog != null
-                    && deviceDialog.isShowing()
-                ) {
-                    deviceDialog.dismiss();
-                }
-
-                connectDevice(
-                    device,
-                    finalName
-                );
-            });
-
-            deviceList.addView(item);
-        }
-    }
-
-    private void stopScan() {
-        if (!scanning) return;
-
-        scanning = false;
-
-        if (scanner != null) {
-            try {
-                scanner.stopScan(scanCallback);
-            } catch (Exception ignored) {
-            }
-        }
-
-        addLog("SCAN STOP");
-    }
-
-    // ==============================
-    // BLE CONNECTION
-    // ==============================
-
-    private void reconnectSavedDevice() {
-        if (
-            !autoReconnect
-            || deviceAddress.isEmpty()
-            || adapter == null
-            || !adapter.isEnabled()
-            || !hasBluetoothPermissions()
-            || connected
-            || connecting
-        ) {
-            return;
-        }
+        candidates.clear();
 
         try {
-            BluetoothDevice device =
-                adapter.getRemoteDevice(
-                    deviceAddress
-                );
+            scanner =
+                adapter.getBluetoothLeScanner();
 
-            connectDevice(
-                device,
-                deviceName
+            if (scanner == null) {
+                choosing = false;
+                setStatus("검색 불가");
+                return;
+            }
+
+            scanner.startScan(scanCallback);
+            scanning = true;
+
+            setStatus("주변 BLE 기기 검색 중...");
+
+            handler.removeCallbacks(timeoutTask);
+
+            handler.postDelayed(
+                timeoutTask, 8000
             );
-        } catch (Exception e) {
-            addLog(
-                "RECONNECT ERROR "
-                + e.getMessage()
-            );
+        } catch (SecurityException e) {
+            choosing = false;
+            setStatus("권한 오류");
         }
     }
 
-    private void connectDevice(
+    private void showCandidates() {
+        if (isFinishing() || isDestroyed()) return;
+
+        if (candidates.isEmpty()) {
+            new AlertDialog.Builder(this)
+                .setTitle("기기를 찾지 못했어요")
+                .setMessage(
+                    "차량 LED 전원을 확인하고 다시 검색하세요."
+                )
+                .setPositiveButton(
+                    "다시 검색",
+                    (dialog, which) -> startDevicePicker()
+                )
+                .setNegativeButton("닫기", null)
+                .show();
+
+            return;
+        }
+
+        ArrayList<BluetoothDevice> devices =
+            new ArrayList<>(candidates.values());
+
+        String[] names =
+            new String[devices.size()];
+
+        for (int i = 0; i < devices.size(); i++) {
+            BluetoothDevice device =
+                devices.get(i);
+
+            String name = null;
+
+            try {
+                name = device.getName();
+            } catch (SecurityException ignored) {}
+
+            names[i] =
+                (name == null || name.isEmpty()
+                    ? "이름 없는 BLE 기기"
+                    : name)
+                + " · " + device.getAddress();
+        }
+
+        new AlertDialog.Builder(this)
+            .setTitle("차량 기기 선택")
+            .setItems(
+                names,
+                (dialog, index) -> {
+                    BluetoothDevice device =
+                        devices.get(index);
+
+                    String name = names[index];
+
+                    int separator =
+                        name.lastIndexOf(" · ");
+
+                    if (separator >= 0) {
+                        name = name.substring(
+                            0, separator
+                        );
+                    }
+
+                    connect(device, name);
+                }
+            )
+            .setNegativeButton("취소", null)
+            .setNeutralButton(
+                "다시 검색",
+                (dialog, which) -> startDevicePicker()
+            )
+            .show();
+    }
+
+    private void connect(
         BluetoothDevice device,
         String name
     ) {
-        if (!hasBluetoothPermissions()) {
-            requestBluetoothPermissions();
-            return;
-        }
+        if (connected || connecting) return;
 
-        disconnectGatt();
+        stopScan();
 
-        deviceAddress = device.getAddress();
-        deviceName = name;
+        choosing = false;
 
-        saveSettings();
+        disconnect();
 
         connecting = true;
-        connected = false;
 
-        updateStatus();
+        if (name != null) {
+            deviceName = name;
+        }
+
+        setStatus("연결 중...");
 
         try {
-            if (Build.VERSION.SDK_INT >= 23) {
-                gatt = device.connectGatt(
-                    this,
-                    false,
-                    gattCallback,
-                    BluetoothDevice.TRANSPORT_LE
-                );
-            } else {
-                gatt = device.connectGatt(
-                    this,
-                    false,
-                    gattCallback
-                );
+            gatt = device.connectGatt(
+                this,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            );
+
+            if (gatt == null) {
+                connecting = false;
+                setStatus("연결 시작 실패");
+                scheduleRetry();
             }
-
-            addLog(
-                "CONNECT " + deviceAddress
-            );
-        } catch (Exception e) {
+        } catch (SecurityException e) {
             connecting = false;
-
-            addLog(
-                "CONNECT ERROR "
-                + e.getMessage()
-            );
-
-            updateStatus();
+            setStatus("연결 권한 오류");
+            scheduleRetry();
         }
     }
 
-    private final BluetoothGattCallback gattCallback =
-        new BluetoothGattCallback() {
+    private void lost(
+        BluetoothGatt current,
+        String reason
+    ) {
+        if (current != gatt) return;
 
-            @Override
-            public void onConnectionStateChange(
-                BluetoothGatt bluetoothGatt,
-                int status,
-                int newState
-            ) {
-                if (bluetoothGatt != gatt) {
-                    try {
-                        bluetoothGatt.close();
-                    } catch (Exception ignored) {
-                    }
-                    return;
-                }
-
-                if (
-                    status == BluetoothGatt.GATT_SUCCESS
-                    &&
-                    newState ==
-                        BluetoothProfile.STATE_CONNECTED
-                ) {
-                    try {
-                        bluetoothGatt.discoverServices();
-                    } catch (Exception e) {
-                        addLog(
-                            "DISCOVERY ERROR"
-                        );
-                    }
-                } else {
-                    connected = false;
-                    connecting = false;
-                    writeChar = null;
-
-                    modeRunning = false;
-
-                    stopPhoneAnimation();
-                    clearSendQueue();
-
-                    handler.post(
-                        () -> updateStatus()
-                    );
-
-                    addLog(
-                        "DISCONNECTED " + status
-                    );
-                }
-            }
-
-            @Override
-            public void onServicesDiscovered(
-                BluetoothGatt bluetoothGatt,
-                int status
-            ) {
-                if (
-                    bluetoothGatt != gatt
-                    || status !=
-                        BluetoothGatt.GATT_SUCCESS
-                ) {
-                    return;
-                }
-
-                BluetoothGattService service =
-                    bluetoothGatt.getService(
-                        SERVICE_UUID
-                    );
-
-                if (service == null) {
-                    addLog(
-                        "SERVICE NOT FOUND"
-                    );
-                    return;
-                }
-
-                writeChar =
-                    service.getCharacteristic(
-                        WRITE_UUID
-                    );
-
-                if (writeChar == null) {
-                    addLog(
-                        "WRITE CHARACTERISTIC NOT FOUND"
-                    );
-                    return;
-                }
-
-                int properties =
-                    writeChar.getProperties();
-
-                if (
-                    (properties &
-                        BluetoothGattCharacteristic
-                            .PROPERTY_WRITE_NO_RESPONSE)
-                    != 0
-                ) {
-                    writeChar.setWriteType(
-                        BluetoothGattCharacteristic
-                            .WRITE_TYPE_NO_RESPONSE
-                    );
-                } else {
-                    writeChar.setWriteType(
-                        BluetoothGattCharacteristic
-                            .WRITE_TYPE_DEFAULT
-                    );
-                }
-
-                connected = true;
-                connecting = false;
-
-                addLog(
-                    "BLE READY"
-                );
-
-                handler.post(() -> {
-                    updateStatus();
-                    toast(
-                        "블루투스 연결 완료"
-                    );
-                });
-            }
-
-            @Override
-            public void onCharacteristicWrite(
-                BluetoothGatt bluetoothGatt,
-                BluetoothGattCharacteristic characteristic,
-                int status
-            ) {
-                if (status != BluetoothGatt.GATT_SUCCESS) {
-                    addLog(
-                        "WRITE CALLBACK ERROR " + status
-                    );
-                }
-            }
-        };
-
-    private void disconnectGatt() {
-        stopPhoneAnimation();
+        gatt = null;
+        writeChar = null;
 
         connected = false;
         connecting = false;
 
-        writeChar = null;
+        sendQueue.clear();
+        sending = false;
 
-        clearSendQueue();
+        handler.removeCallbacks(sendTask);
+        stopPhoneTask();
+
+        try {
+            current.close();
+        } catch (Exception ignored) {}
+
+        setStatus(reason);
+
+        scheduleRetry();
+    }
+
+    private void stopScan() {
+        handler.removeCallbacks(timeoutTask);
+
+        if (scanning && scanner != null) {
+            try {
+                scanner.stopScan(scanCallback);
+            } catch (Exception ignored) {}
+        }
+
+        scanning = false;
+    }
+
+    private void disconnect() {
+        stopScan();
+
+        handler.removeCallbacks(retryTask);
+        handler.removeCallbacks(colorTask);
+        handler.removeCallbacks(brightnessTask);
+        handler.removeCallbacks(speedTask);
+        handler.removeCallbacks(sendTask);
+
+        stopPhoneTask();
+
+        sendQueue.clear();
+        sending = false;
 
         BluetoothGatt old = gatt;
+
         gatt = null;
+        writeChar = null;
+
+        connected = false;
+        connecting = false;
 
         if (old != null) {
             try {
                 old.disconnect();
                 old.close();
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
         }
-
-        updateStatus();
     }
 
-    // ==============================
-    // BLE COMMAND QUEUE
-    // ==============================
+    private void scheduleRetry() {
+        handler.removeCallbacks(retryTask);
 
-    private void send(byte[] data) {
-        if (
-            !connected
-            || gatt == null
-            || writeChar == null
-        ) {
+        if (active &&
+            !choosing &&
+            !savedAddress.isEmpty() &&
+            !connected &&
+            !connecting) {
+
+            handler.postDelayed(
+                retryTask, 4000
+            );
+        }
+    }
+
+    // BLE 명령 전송
+    private void send(byte[] bytes) {
+        if (!connected ||
+            gatt == null ||
+            writeChar == null) {
             return;
         }
-
-        byte[] copy =
-            Arrays.copyOf(
-                data,
-                data.length
-            );
 
         if (sendQueue.size() >= 15) {
             sendQueue.poll();
         }
 
-        sendQueue.offer(copy);
+        sendQueue.offer(bytes);
+
+        log("TX " + toHex(bytes));
 
         if (!sending) {
             sending = true;
@@ -2723,214 +2464,392 @@ public class MainActivity extends Activity {
         }
     }
 
-    private final Runnable sendTask =
-        new Runnable() {
-            @Override
-            public void run() {
-                if (
-                    !connected
-                    || gatt == null
-                    || writeChar == null
-                ) {
-                    sendQueue.clear();
-                    sending = false;
-                    return;
-                }
-
-                byte[] data =
-                    sendQueue.poll();
-
-                if (data == null) {
-                    sending = false;
-                    return;
-                }
-
-                try {
-                    int result;
-
-                    if (Build.VERSION.SDK_INT >= 33) {
-                        result =
-                            gatt.writeCharacteristic(
-                                writeChar,
-                                data,
-                                writeChar.getWriteType()
-                            );
-                    } else {
-                        writeChar.setValue(data);
-
-                        boolean success =
-                            gatt.writeCharacteristic(
-                                writeChar
-                            );
-
-                        result = success
-                            ? BluetoothStatusCodes.SUCCESS
-                            : -1;
-                    }
-
-                    addLog(
-                        (result ==
-                            BluetoothStatusCodes.SUCCESS
-                            ? "TX "
-                            : "TX ERROR(" + result + ") ")
-                        + bytesToHex(data)
-                    );
-
-                } catch (Exception e) {
-                    addLog(
-                        "TX EXCEPTION "
-                        + e.getMessage()
-                    );
-                }
-
-                handler.postDelayed(
-                    this,
-                    110
-                );
-            }
-        };
-
-    private void clearSendQueue() {
-        sendQueue.clear();
-
-        handler.removeCallbacks(sendTask);
-
-        sending = false;
-    }
-
-    // ==============================
-    // HEX HELPERS
-    // ==============================
-
-    private static byte[] hex(String input) {
-        String clean =
-            input.replaceAll(
-                "\\s+", ""
-            );
-
-        if (
-            clean.length() % 2 != 0
-        ) {
-            throw new IllegalArgumentException(
-                "Invalid HEX length"
-            );
-        }
-
-        byte[] result =
-            new byte[clean.length() / 2];
-
-        for (
-            int i = 0;
-            i < result.length;
-            i++
-        ) {
-            int index = i * 2;
-
-            result[i] =
-                (byte) Integer.parseInt(
-                    clean.substring(
-                        index,
-                        index + 2
-                    ),
-                    16
-                );
-        }
-
-        return result;
-    }
-
-    private static String bytesToHex(
-        byte[] bytes
-    ) {
-        StringBuilder sb =
+    private static String toHex(byte[] data) {
+        StringBuilder out =
             new StringBuilder();
 
-        for (byte b : bytes) {
-            if (sb.length() > 0) {
-                sb.append(" ");
-            }
-
-            sb.append(
+        for (byte value : data) {
+            out.append(
                 String.format(
                     Locale.US,
                     "%02X",
-                    b & 0xFF
+                    value & 255
                 )
             );
         }
 
-        return sb.toString();
+        return out.toString();
     }
 
-    // ==============================
-    // SEEK LISTENER
-    // ==============================
+    // v0.9 정상 RGB 패킷 복원
+    private static byte[] rgbPacket(
+        int red,
+        int green,
+        int blue
+    ) {
+        return new byte[]{
+            0x7B,
+            0x01,
+            0x07,
+            (byte)red,
+            (byte)green,
+            (byte)blue,
+            0x00,
+            (byte)0xFF,
+            (byte)0xBF
+        };
+    }
 
-    private abstract static class SimpleSeekListener
-        implements SeekBar.OnSeekBarChangeListener {
+    // 내장 모드 속도
+    private static byte[] speedPacket(int percent) {
+        return rawSpeedPacket(
+            Math.max(1, Math.min(100, percent))
+        );
+    }
 
-        @Override
-        public void onProgressChanged(
-            SeekBar seekBar,
-            int progress,
-            boolean fromUser
-        ) {
+    private static byte[] rawSpeedPacket(int value) {
+        return new byte[]{
+            0x7B,
+            (byte)0xFF,
+            0x02,
+            (byte)(value & 255),
+            (byte)0xFF,
+            0x00,
+            (byte)0xFF,
+            (byte)0xFF,
+            (byte)0xBF
+        };
+    }
+
+    // v0.9 밝기 패킷 유지
+    private static byte[] brightnessPacket(
+        int percent
+    ) {
+        int value =
+            Math.max(1, Math.min(100, percent));
+
+        return new byte[]{
+            0x7B,
+            (byte)0xFF,
+            0x01,
+            (byte)(value == 1 ? 0x00 : 0x20),
+            (byte)value,
+            0x02,
+            (byte)0xFF,
+            (byte)0xFF,
+            (byte)0xBF
+        };
+    }
+
+    private static byte[] hex(String value) {
+        byte[] bytes =
+            new byte[value.length() / 2];
+
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte)Integer.parseInt(
+                value.substring(
+                    i * 2,
+                    i * 2 + 2
+                ),
+                16
+            );
         }
 
-        @Override
-        public void onStartTrackingTouch(
-            SeekBar seekBar
-        ) {
-        }
+        return bytes;
+    }
 
-        @Override
-        public void onStopTrackingTouch(
-            SeekBar seekBar
-        ) {
+    @Override
+    public void onBackPressed() {
+        if (developerVisible) {
+            showSettingsPage();
+        } else if (settingsVisible) {
+            showMainPage();
+        } else {
+            super.onBackPressed();
         }
     }
 
-    // ==============================
-    // COLOR WHEEL
-    // ==============================
+    @Override
+    protected void onDestroy() {
+        active = false;
 
-    private class ColorWheel extends View {
+        stopPhoneTask();
 
-        private Bitmap bitmap;
-        private Paint paint =
+        // 앱 종료 시 내장 효과 중지 명령 전송 금지
+        disconnect();
+
+        handler.removeCallbacksAndMessages(null);
+
+        super.onDestroy();
+    }
+
+    // 전원 / 설정 / 뒤로 가기 아이콘
+    private class IconView extends View {
+
+        private final Paint paint =
             new Paint(Paint.ANTI_ALIAS_FLAG);
 
-        private int lastSize = 0;
+        private final boolean isPower;
+        private final boolean isBack;
 
-        private ColorSelectedListener listener;
-
-        ColorWheel(Context context) {
-            super(context);
+        IconView(
+            Context context,
+            boolean power
+        ) {
+            this(context, power, false);
         }
 
-        void setOnColorSelectedListener(
-            ColorSelectedListener l
+        IconView(
+            Context context,
+            boolean power,
+            boolean back
         ) {
-            listener = l;
+            super(context);
+
+            isPower = power;
+            isBack = back;
+
+            setClickable(true);
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
 
-            int size = Math.min(
-                getWidth(),
-                getHeight()
+            float cx = getWidth() / 2f;
+            float cy = getHeight() / 2f;
+
+            float radius =
+                Math.min(
+                    getWidth(),
+                    getHeight()
+                ) * 0.22f;
+
+            paint.setColor(
+                isPower
+                    ? (powerOn ? accent() : muted())
+                    : fg()
             );
+
+            paint.setStyle(Paint.Style.STROKE);
+
+            paint.setStrokeWidth(
+                getResources()
+                    .getDisplayMetrics()
+                    .density * 2.4f
+            );
+
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            paint.setStrokeJoin(Paint.Join.ROUND);
+
+            if (isBack) {
+                canvas.drawLine(
+                    cx + radius, cy,
+                    cx - radius, cy,
+                    paint
+                );
+
+                canvas.drawLine(
+                    cx - radius, cy,
+                    cx, cy - radius,
+                    paint
+                );
+
+                canvas.drawLine(
+                    cx - radius, cy,
+                    cx, cy + radius,
+                    paint
+                );
+
+            } else if (isPower) {
+                canvas.drawArc(
+                    new RectF(
+                        cx - radius,
+                        cy - radius,
+                        cx + radius,
+                        cy + radius
+                    ),
+                    -48,
+                    276,
+                    false,
+                    paint
+                );
+
+                canvas.drawLine(
+                    cx,
+                    cy - radius * 1.3f,
+                    cx,
+                    cy + radius * 0.08f,
+                    paint
+                );
+
+            } else {
+                canvas.drawCircle(
+                    cx, cy,
+                    radius * 0.86f,
+                    paint
+                );
+
+                canvas.drawCircle(
+                    cx, cy,
+                    radius * 0.31f,
+                    paint
+                );
+
+                for (int i = 0; i < 8; i++) {
+                    double angle =
+                        Math.PI * i / 4;
+
+                    canvas.drawLine(
+                        cx +
+                        (float)Math.cos(angle) *
+                        radius * 0.91f,
+                        cy +
+                        (float)Math.sin(angle) *
+                        radius * 0.91f,
+                        cx +
+                        (float)Math.cos(angle) *
+                        radius * 1.24f,
+                        cy +
+                        (float)Math.sin(angle) *
+                        radius * 1.24f,
+                        paint
+                    );
+                }
+            }
+        }
+    }
+
+    // HSV 컬러휠
+    private static class ColorWheel extends View {
+
+        interface Listener {
+            void onColorChange(
+                int r,
+                int g,
+                int b
+            );
+        }
+
+        private Listener listener;
+        private Bitmap bitmap;
+
+        private final Paint paint =
+            new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        private float hue = 0f;
+        private float saturation = 1f;
+
+        ColorWheel(Context context) {
+            super(context);
+        }
+
+        void setOnColorChange(Listener value) {
+            listener = value;
+        }
+
+        void setSelectedColor(int color) {
+            float[] hsv = new float[3];
+
+            Color.colorToHSV(color, hsv);
+
+            hue = hsv[0];
+            saturation = hsv[1];
+
+            invalidate();
+        }
+
+        @Override
+        protected void onSizeChanged(
+            int width,
+            int height,
+            int oldWidth,
+            int oldHeight
+        ) {
+            super.onSizeChanged(
+                width,
+                height,
+                oldWidth,
+                oldHeight
+            );
+
+            if (bitmap != null) {
+                bitmap.recycle();
+            }
+
+            int size =
+                Math.min(width, height);
 
             if (size <= 0) return;
 
-            if (
-                bitmap == null
-                || lastSize != size
-            ) {
-                generateBitmap(size);
+            bitmap = Bitmap.createBitmap(
+                size,
+                size,
+                Bitmap.Config.ARGB_8888
+            );
+
+            int[] pixels =
+                new int[size * size];
+
+            float radius = size / 2f;
+
+            for (int y = 0; y < size; y++) {
+                for (int x = 0; x < size; x++) {
+
+                    float dx = x - radius;
+                    float dy = y - radius;
+
+                    float distance =
+                        (float)Math.sqrt(
+                            dx * dx + dy * dy
+                        );
+
+                    if (distance > radius - 2) {
+                        pixels[y * size + x] =
+                            Color.TRANSPARENT;
+                    } else {
+                        float angle =
+                            (float)Math.toDegrees(
+                                Math.atan2(dy, dx)
+                            );
+
+                        if (angle < 0) {
+                            angle += 360;
+                        }
+
+                        pixels[y * size + x] =
+                            Color.HSVToColor(
+                                new float[]{
+                                    angle,
+                                    Math.min(
+                                        1f,
+                                        distance / (radius - 2)
+                                    ),
+                                    1f
+                                }
+                            );
+                    }
+                }
             }
+
+            bitmap.setPixels(
+                pixels,
+                0,
+                size,
+                0,
+                0,
+                size,
+                size
+            );
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+
+            if (bitmap == null) return;
+
+            float size = bitmap.getWidth();
 
             float left =
                 (getWidth() - size) / 2f;
@@ -2944,99 +2863,56 @@ public class MainActivity extends Activity {
                 top,
                 paint
             );
-        }
 
-        private void generateBitmap(
-            int size
-        ) {
-            if (
-                bitmap != null
-                && !bitmap.isRecycled()
-            ) {
-                bitmap.recycle();
-            }
+            float radians =
+                (float)Math.toRadians(hue);
 
-            bitmap = Bitmap.createBitmap(
-                size,
-                size,
-                Bitmap.Config.ARGB_8888
+            float distance =
+                (size / 2f - 2f) * saturation;
+
+            float x =
+                left + size / 2f +
+                (float)Math.cos(radians) *
+                distance;
+
+            float y =
+                top + size / 2f +
+                (float)Math.sin(radians) *
+                distance;
+
+            float density =
+                getResources()
+                    .getDisplayMetrics()
+                    .density;
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(5f);
+            paint.setColor(Color.BLACK);
+
+            canvas.drawCircle(
+                x, y,
+                12f * density,
+                paint
             );
 
-            int[] pixels =
-                new int[size * size];
+            paint.setStrokeWidth(3f);
+            paint.setColor(Color.WHITE);
 
-            float center = size / 2f;
-            float radius = center - 2;
-
-            float[] hsv = {
-                0f, 0f, 1f
-            };
-
-            for (int y = 0; y < size; y++) {
-                for (int x = 0; x < size; x++) {
-                    float dx =
-                        x - center;
-
-                    float dy =
-                        y - center;
-
-                    float distance =
-                        (float) Math.sqrt(
-                            dx * dx + dy * dy
-                        );
-
-                    if (distance > radius) {
-                        pixels[y * size + x] =
-                            Color.TRANSPARENT;
-
-                        continue;
-                    }
-
-                    float angle =
-                        (float) Math.toDegrees(
-                            Math.atan2(dy, dx)
-                        );
-
-                    if (angle < 0) {
-                        angle += 360f;
-                    }
-
-                    hsv[0] = angle;
-                    hsv[1] =
-                        Math.min(
-                            1f,
-                            distance / radius
-                        );
-
-                    pixels[y * size + x] =
-                        Color.HSVToColor(hsv);
-                }
-            }
-
-            bitmap.setPixels(
-                pixels,
-                0,
-                size,
-                0,
-                0,
-                size,
-                size
+            canvas.drawCircle(
+                x, y,
+                14f * density,
+                paint
             );
 
-            lastSize = size;
+            paint.setStyle(Paint.Style.FILL);
         }
 
         @Override
-        public boolean onTouchEvent(
-            android.view.MotionEvent event
-        ) {
-            if (
-                event.getAction()
-                    != MotionEvent.ACTION_DOWN
-                &&
-                event.getAction()
-                    != MotionEvent.ACTION_MOVE
-            ) {
+        public boolean onTouchEvent(MotionEvent event) {
+            int action = event.getAction();
+
+            if (action != MotionEvent.ACTION_DOWN &&
+                action != MotionEvent.ACTION_MOVE) {
                 return true;
             }
 
@@ -3046,69 +2922,51 @@ public class MainActivity extends Activity {
                     getHeight()
                 );
 
-            float left =
-                (getWidth() - size) / 2f;
-
-            float top =
-                (getHeight() - size) / 2f;
-
             float dx =
-                event.getX()
-                - left
-                - size / 2f;
+                event.getX() -
+                getWidth() / 2f;
 
             float dy =
-                event.getY()
-                - top
-                - size / 2f;
+                event.getY() -
+                getHeight() / 2f;
 
-            float radius =
-                size / 2f - 2f;
-
-            float distance =
-                (float) Math.sqrt(
-                    dx * dx + dy * dy
-                );
-
-            if (distance > radius) {
-                return true;
-            }
-
-            float hue =
-                (float) Math.toDegrees(
+            hue =
+                (float)Math.toDegrees(
                     Math.atan2(dy, dx)
                 );
 
             if (hue < 0) {
-                hue += 360f;
+                hue += 360;
             }
 
-            float saturation =
+            saturation =
                 Math.min(
                     1f,
-                    distance / radius
+                    (float)Math.sqrt(
+                        dx * dx + dy * dy
+                    ) / (size / 2f - 2f)
                 );
 
             int color =
                 Color.HSVToColor(
-                    new float[] {
+                    new float[]{
                         hue,
                         saturation,
                         1f
                     }
                 );
 
+            invalidate();
+
             if (listener != null) {
-                listener.onColorSelected(
-                    color
+                listener.onColorChange(
+                    Color.red(color),
+                    Color.green(color),
+                    Color.blue(color)
                 );
             }
 
             return true;
         }
-    }
-
-    private interface ColorSelectedListener {
-        void onColorSelected(int color);
     }
 }
