@@ -17,21 +17,165 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify Android project
+      - name: Inspect repository structure
+        shell: bash
         run: |
-          echo "Checking Android project files..."
+          echo "================================"
+          echo "Repository structure"
+          echo "================================"
 
-          test -f settings.gradle || test -f settings.gradle.kts
-          test -f app/build.gradle || test -f app/build.gradle.kts
-          test -f app/src/main/AndroidManifest.xml
+          pwd
+          ls -la
 
-          echo "Android project files found."
+          echo "================================"
+          echo "Android project files"
+          echo "================================"
 
-          echo "Manifest file:"
-          ls -l app/src/main/AndroidManifest.xml
+          find . -maxdepth 5 -type f \
+            | sort \
+            | head -n 150
 
-          echo "Manifest first lines:"
-          head -n 5 app/src/main/AndroidManifest.xml
+          echo "================================"
+          echo "Checking required files"
+          echo "================================"
+
+          if [ -f settings.gradle ]; then
+            echo "OK: settings.gradle"
+          elif [ -f settings.gradle.kts ]; then
+            echo "OK: settings.gradle.kts"
+          else
+            echo "MISSING: settings.gradle"
+          fi
+
+          if [ -f app/build.gradle ]; then
+            echo "OK: app/build.gradle"
+          elif [ -f app/build.gradle.kts ]; then
+            echo "OK: app/build.gradle.kts"
+          else
+            echo "MISSING: app/build.gradle"
+          fi
+
+          if [ -f app/src/main/AndroidManifest.xml ]; then
+            echo "OK: app/src/main/AndroidManifest.xml"
+          else
+            echo "MISSING: app/src/main/AndroidManifest.xml"
+          fi
+
+          if [ -f AndroidManifest.xml ]; then
+            echo "FOUND: Root AndroidManifest.xml"
+          fi
+
+          if [ -f MainActivity.java ]; then
+            echo "FOUND: Root MainActivity.java"
+          fi
+
+      - name: Restore Android project structure
+        shell: bash
+        run: |
+          echo "Restoring Android project structure..."
+
+          mkdir -p app/src/main
+          mkdir -p app/src/main/java/com/ledcar/ambient
+
+          if [ -f AndroidManifest.xml ]; then
+            if [ ! -f app/src/main/AndroidManifest.xml ]; then
+              cp AndroidManifest.xml \
+                app/src/main/AndroidManifest.xml
+              echo "Restored root AndroidManifest.xml"
+            else
+              echo "Using existing app AndroidManifest.xml"
+            fi
+          fi
+
+          if [ -f MainActivity.java ]; then
+            if [ ! -f app/src/main/java/com/ledcar/ambient/MainActivity.java ]; then
+              cp MainActivity.java \
+                app/src/main/java/com/ledcar/ambient/MainActivity.java
+              echo "Restored root MainActivity.java"
+            else
+              echo "Using existing MainActivity.java"
+            fi
+          fi
+
+          if [ ! -f app/build.gradle ] && \
+             [ ! -f app/build.gradle.kts ]; then
+
+            echo "Creating app/build.gradle"
+
+            cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.ledcar.ambient'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.ledcar.ambient'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '0.1'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+          fi
+
+          echo "Project restoration finished."
+
+      - name: Validate project files
+        shell: bash
+        run: |
+          echo "================================"
+          echo "Final project validation"
+          echo "================================"
+
+          if [ -f settings.gradle ] || \
+             [ -f settings.gradle.kts ]; then
+            echo "OK: Gradle settings"
+          else
+            echo "WARNING: Gradle settings missing"
+          fi
+
+          if [ -f app/build.gradle ] || \
+             [ -f app/build.gradle.kts ]; then
+            echo "OK: App Gradle configuration"
+          else
+            echo "ERROR: App Gradle configuration missing"
+            exit 1
+          fi
+
+          if [ -f app/src/main/AndroidManifest.xml ]; then
+            echo "OK: AndroidManifest.xml"
+          else
+            echo "ERROR: AndroidManifest.xml missing"
+            exit 1
+          fi
+
+          echo "================================"
+          echo "Manifest content"
+          echo "================================"
+
+          cat -n app/src/main/AndroidManifest.xml
+
+          echo "================================"
+          echo "Manifest file encoding"
+          echo "================================"
+
+          file app/src/main/AndroidManifest.xml
+
+          echo "================================"
+          echo "Manifest first bytes"
+          echo "================================"
+
+          od -An -tx1 -N32 \
+            app/src/main/AndroidManifest.xml
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -40,19 +184,27 @@ jobs:
           java-version: '17'
 
       - name: Configure Android SDK
+        shell: bash
         run: |
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" \
+            >> "$GITHUB_PATH"
+
+          echo "$ANDROID_HOME/platform-tools" \
+            >> "$GITHUB_PATH"
 
       - name: Install Android SDK 35
+        shell: bash
         run: |
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)
+            SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+              -name sdkmanager -type f | head -n 1)
           fi
 
-          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+          "$SDKMANAGER" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -60,7 +212,12 @@ jobs:
           gradle-version: '8.7'
 
       - name: Build APK
-        run: gradle --no-daemon :app:assembleDebug --stacktrace --info
+        shell: bash
+        run: |
+          gradle --no-daemon \
+            :app:assembleDebug \
+            --stacktrace \
+            --info
 
       - name: Upload APK
         if: success()
