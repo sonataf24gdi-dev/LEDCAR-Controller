@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission
@@ -25,6 +25,9 @@
 
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS" />
 
     <uses-feature
         android:name="android.hardware.bluetooth_le"
@@ -69,6 +72,12 @@
         <service
             android:name=".WidgetBleService"
             android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <service
+            android:name=".SequentialBleService"
+            android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="connectedDevice" />
 
     </application>
