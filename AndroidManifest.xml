@@ -1,9 +1,7 @@
 
 <?xml version="1.0" encoding="utf-8"?>
-
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Android 11 이하 블루투스 권한 -->
     <uses-permission
         android:name="android.permission.BLUETOOTH"
         android:maxSdkVersion="30" />
@@ -16,7 +14,6 @@
         android:name="android.permission.ACCESS_FINE_LOCATION"
         android:maxSdkVersion="30" />
 
-    <!-- Android 12 이상 블루투스 권한 -->
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation" />
@@ -24,14 +21,12 @@
     <uses-permission
         android:name="android.permission.BLUETOOTH_CONNECT" />
 
-    <!-- 위젯 BLE 서비스 권한 -->
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE" />
 
     <uses-permission
         android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
-    <!-- 기존 BLE 필수 설정 유지 -->
     <uses-feature
         android:name="android.hardware.bluetooth_le"
         android:required="true" />
@@ -42,9 +37,8 @@
         android:supportsRtl="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
-        <!-- 기존 메인 화면 -->
         <activity
-            android:name="com.ledcar.ambient.MainActivity"
+            android:name=".MainActivity"
             android:exported="true">
 
             <intent-filter>
@@ -54,14 +48,17 @@
 
         </activity>
 
-        <!-- 4×2 홈 화면 위젯 -->
+        <activity
+            android:name=".WidgetSettingsActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
+
         <receiver
-            android:name="com.ledcar.ambient.AmbientWidget"
+            android:name=".AmbientWidget"
             android:exported="true">
 
             <intent-filter>
-                <action
-                    android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
 
             <meta-data
@@ -70,17 +67,10 @@
 
         </receiver>
 
-        <!-- 위젯 블루투스 연결 서비스 -->
         <service
-            android:name="com.ledcar.ambient.WidgetBleService"
+            android:name=".WidgetBleService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
-
-        <!-- 위젯 배경 투명도 설정 화면 -->
-        <activity
-            android:name="com.ledcar.ambient.WidgetSettingsActivity"
-            android:exported="false"
-            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
 
     </application>
 
