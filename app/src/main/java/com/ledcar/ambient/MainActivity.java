@@ -13,6 +13,7 @@ import android.os.*;
 import android.text.InputType;
 import android.view.*;
 import android.widget.*;
+
 import java.util.*;
 
 public class MainActivity extends Activity {
@@ -20,16 +21,20 @@ public class MainActivity extends Activity {
     private static final UUID SERVICE = UUID.fromString(
         "0000ffe0-0000-1000-8000-00805f9b34fb"
     );
+
     private static final UUID WRITE = UUID.fromString(
         "0000ffe1-0000-1000-8000-00805f9b34fb"
     );
 
     private static final byte[] ON =
         hex("7BFF0407FFFFFFFFBF");
+
     private static final byte[] OFF =
         hex("7BFF0406FFFFFFFFBF");
+
     private static final byte[] SEQUENTIAL =
         hex("7BFF0351FFFFFFFFBF");
+
     private static final byte[] RAINBOW =
         hex("7BFF0301FFFFFFFFBF");
 
@@ -64,6 +69,8 @@ public class MainActivity extends Activity {
     private boolean powerOn = true;
     private boolean dark;
     private boolean modeRunning;
+    private boolean phoneServiceActive;
+    private boolean phoneStopPending;
 
     private int currentTab;
     private int selectedMode;
@@ -74,9 +81,6 @@ public class MainActivity extends Activity {
     private int b;
     private int brightness = 100;
     private int modeSpeed = 50;
-
-    private float phoneHue;
-    private long phoneLastTick;
 
     private final int[] presets = new int[6];
     private final boolean[] presetSaved = new boolean[6];
@@ -112,14 +116,36 @@ public class MainActivity extends Activity {
         new ArrayDeque<>();
 
     private boolean sending;
+
     private final StringBuilder logBuffer =
         new StringBuilder();
 
-    // BLE 전송 큐
+    private SharedPreferences prefs() {
+        return getSharedPreferences(
+            "MainActivity",
+            MODE_PRIVATE
+        );
+    }
+
+    private boolean isPhoneServiceActive() {
+        return prefs().getBoolean(
+            "phone_service_active",
+            false
+        );
+    }
+
+    private boolean phoneBusy() {
+        return phoneServiceActive || phoneStopPending;
+    }
+
     private final Runnable sendTask = new Runnable() {
         @Override
         public void run() {
-            if (!connected || gatt == null || writeChar == null) {
+            if (!connected ||
+                gatt == null ||
+                writeChar == null ||
+                phoneBusy()) {
+
                 sendQueue.clear();
                 sending = false;
                 return;
@@ -133,18 +159,20 @@ public class MainActivity extends Activity {
             }
 
             try {
-                int props = writeChar.getProperties();
+                int properties = writeChar.getProperties();
 
                 int type =
-                    (props &
-                    BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)
+                    (properties &
+                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE)
                     != 0
                     ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                     : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
 
                 if (Build.VERSION.SDK_INT >= 33) {
                     int result = gatt.writeCharacteristic(
-                        writeChar, packet, type
+                        writeChar,
+                        packet,
+                        type
                     );
 
                     if (result != BluetoothStatusCodes.SUCCESS) {
@@ -168,28 +196,30 @@ public class MainActivity extends Activity {
     };
 
     private final Runnable colorTask = () -> {
-        if (connected && !modeRunning && powerOn) {
+        if (connected && !modeRunning &&
+            powerOn && !phoneBusy()) {
             send(rgbPacket(r, g, b));
         }
     };
 
     private final Runnable brightnessTask = () -> {
-        if (connected) {
+        if (connected && !phoneBusy()) {
             send(brightnessPacket(brightness));
         }
     };
 
     private final Runnable speedTask = () -> {
-        if (connected &&
-            !(modeRunning &&
-              selectedMode == 0 &&
-              sequentialEngine == ENGINE_PHONE)) {
+        if (connected && !phoneBusy()) {
             send(speedPacket(modeSpeed));
         }
     };
 
     private final Runnable retryTask = () -> {
-        if (active && !connected && !connecting && !choosing) {
+        if (active &&
+            !phoneBusy() &&
+            !connected &&
+            !connecting &&
+            !choosing) {
             scanSaved();
         }
     };
@@ -200,81 +230,71 @@ public class MainActivity extends Activity {
         if (choosing) {
             choosing = false;
             showCandidates();
-        } else if (active && !connected && !connecting) {
+        } else if (active &&
+                   !phoneBusy() &&
+                   !connected &&
+                   !connecting) {
             setStatus("차량 검색 대기 중");
             scheduleRetry();
         }
     };
 
-    // HSV 기반 전체 색상 그라데이션
-    private final Runnable phoneTask = new Runnable() {
+    private final Runnable servicePollTask = new Runnable() {
         @Override
         public void run() {
-            if (!modeRunning ||
-                selectedMode != 0 ||
-                sequentialEngine != ENGINE_PHONE ||
-                !powerOn ||
-                !connected) {
-                return;
+            if (isFinishing() || isDestroyed()) return;
+
+            boolean serviceNow = isPhoneServiceActive();
+
+            if (serviceNow != phoneServiceActive) {
+                phoneServiceActive = serviceNow;
+
+                if (serviceNow) {
+                    phoneStopPending = false;
+                    modeRunning = true;
+                    selectedMode = 0;
+                    sequentialEngine = ENGINE_PHONE;
+
+                    active = false;
+                    disconnect();
+
+                    setStatus("스마트폰 순차점등 실행 중");
+                } else {
+                    phoneStopPending = false;
+                    restoreModeFromPreferences();
+                    active = true;
+
+                    setStatus("차량 연결 확인 중");
+
+                    if (hasPermissions()) {
+                        scanSaved();
+                    }
+                }
+
+                rebuildCurrentPage();
             }
 
-            long now = SystemClock.uptimeMillis();
-
-            if (phoneLastTick == 0L) {
-                phoneLastTick = now;
-            }
-
-            long elapsed = Math.min(
-                1000L,
-                Math.max(0L, now - phoneLastTick)
-            );
-
-            phoneLastTick = now;
-
-            // 속도 1: 한 바퀴 약 120초
-            // 속도 100: 한 바퀴 약 8초
-            double fraction =
-                (Math.max(1, Math.min(100, modeSpeed)) - 1)
-                / 99.0;
-
-            double cycleMillis =
-                120000.0 *
-                Math.pow(8000.0 / 120000.0, fraction);
-
-            phoneHue = (float)(
-                (phoneHue + elapsed * 360.0 / cycleMillis)
-                % 360.0
-            );
-
-            int color = Color.HSVToColor(
-                new float[]{phoneHue, 1f, 1f}
-            );
-
-            // 이전 색상 명령이 밀리지 않도록 제한
-            if (sendQueue.size() <= 2) {
-                send(rgbPacket(
-                    Color.red(color),
-                    Color.green(color),
-                    Color.blue(color)
-                ));
-            }
-
-            handler.postDelayed(this, 140);
+            handler.postDelayed(this, 1000);
         }
     };
 
-    private void stopPhoneTask() {
-        handler.removeCallbacks(phoneTask);
-        phoneLastTick = 0L;
+    private void restoreModeFromPreferences() {
+        SharedPreferences p = prefs();
+
+        selectedMode = p.getInt("selected_mode", 0);
+        sequentialEngine = p.getInt(
+            "sequential_engine",
+            ENGINE_NATIVE
+        );
+
+        modeRunning = p.getBoolean(
+            "mode_running",
+            false
+        );
+
+        modeSpeed = p.getInt("mode_speed", 50);
     }
 
-    private void startPhoneTask() {
-        stopPhoneTask();
-        phoneHue = 0f;
-        handler.post(phoneTask);
-    }
-
-    // BLE 검색
     private final ScanCallback scanCallback =
         new ScanCallback() {
 
@@ -306,7 +326,10 @@ public class MainActivity extends Activity {
             final String foundName = name;
 
             handler.post(() -> {
-                if (!active || connected || connecting) return;
+                if (!active ||
+                    phoneBusy() ||
+                    connected ||
+                    connecting) return;
 
                 if (!choosing &&
                     !savedAddress.isEmpty() &&
@@ -323,6 +346,9 @@ public class MainActivity extends Activity {
             handler.post(() -> {
                 scanning = false;
                 handler.removeCallbacks(timeoutTask);
+
+                if (phoneBusy()) return;
+
                 setStatus("검색 실패 (" + error + ")");
 
                 if (choosing) {
@@ -335,16 +361,17 @@ public class MainActivity extends Activity {
         }
     };
 
-    // GATT 연결
     private final BluetoothGattCallback gattCallback =
         new BluetoothGattCallback() {
 
         @Override
         public void onConnectionStateChange(
-            BluetoothGatt current, int code, int state
+            BluetoothGatt current,
+            int code,
+            int state
         ) {
             handler.post(() -> {
-                if (current != gatt) {
+                if (current != gatt || phoneBusy()) {
                     try {
                         current.close();
                     } catch (Exception ignored) {}
@@ -360,8 +387,8 @@ public class MainActivity extends Activity {
                         if (!current.discoverServices()) {
                             lost(current, "서비스 검색 실패");
                         }
-                    } catch (SecurityException e) {
-                        lost(current, "블루투스 권한 오류");
+                    } catch (Exception e) {
+                        lost(current, "서비스 검색 오류");
                     }
                 } else {
                     lost(current, "연결 끊김 · 재연결 대기");
@@ -371,10 +398,11 @@ public class MainActivity extends Activity {
 
         @Override
         public void onServicesDiscovered(
-            BluetoothGatt current, int code
+            BluetoothGatt current,
+            int code
         ) {
             handler.post(() -> {
-                if (current != gatt) return;
+                if (current != gatt || phoneBusy()) return;
 
                 BluetoothGattService service =
                     code == BluetoothGatt.GATT_SUCCESS
@@ -391,8 +419,10 @@ public class MainActivity extends Activity {
                      BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE))
                     == 0) {
 
-                    lost(current,
-                        "호환되지 않는 기기 (FFE0/FFE1 없음)");
+                    lost(
+                        current,
+                        "호환되지 않는 기기 (FFE0/FFE1 없음)"
+                    );
                     return;
                 }
 
@@ -417,14 +447,6 @@ public class MainActivity extends Activity {
                     .apply();
 
                 setStatus("연결 완료");
-
-                if (modeRunning &&
-                    selectedMode == 0 &&
-                    sequentialEngine == ENGINE_PHONE &&
-                    powerOn) {
-                    startPhoneTask();
-                }
-
                 updateModeUI();
             });
         }
@@ -445,11 +467,13 @@ public class MainActivity extends Activity {
         modeRunning = p.getBoolean("mode_running", false);
 
         int defaultEngine = p.getBoolean(
-            "phone_sequential", false
+            "phone_sequential",
+            false
         ) ? ENGINE_PHONE : ENGINE_NATIVE;
 
         sequentialEngine = p.getInt(
-            "sequential_engine", defaultEngine
+            "sequential_engine",
+            defaultEngine
         );
 
         if (sequentialEngine < 0 ||
@@ -457,9 +481,14 @@ public class MainActivity extends Activity {
             sequentialEngine = ENGINE_NATIVE;
         }
 
-        // 앱 재실행 시 스마트폰 효과 자동 시작 방지
-        if (selectedMode == 0 &&
-            sequentialEngine == ENGINE_PHONE) {
+        phoneServiceActive = isPhoneServiceActive();
+
+        if (phoneServiceActive) {
+            selectedMode = 0;
+            sequentialEngine = ENGINE_PHONE;
+            modeRunning = true;
+        } else if (selectedMode == 0 &&
+                   sequentialEngine == ENGINE_PHONE) {
             modeRunning = false;
         }
 
@@ -485,34 +514,93 @@ public class MainActivity extends Activity {
         showMainPage();
 
         if (hasPermissions()) {
-            startAuto();
+            if (phoneServiceActive) {
+                setStatus("스마트폰 순차점등 실행 중");
+            } else {
+                startAuto();
+            }
         } else {
             requestNeededPermissions();
         }
     }
 
-    private SharedPreferences prefs() {
-        return getPreferences(MODE_PRIVATE);
+    @Override
+    protected void onResume() {
+        super.onResume();
+
+        if (mainRoot == null) return;
+
+        boolean previous = phoneServiceActive;
+        phoneServiceActive = isPhoneServiceActive();
+
+        if (phoneServiceActive) {
+            active = false;
+            disconnect();
+
+            selectedMode = 0;
+            sequentialEngine = ENGINE_PHONE;
+            modeRunning = true;
+
+            setStatus("스마트폰 순차점등 실행 중");
+        } else {
+            restoreModeFromPreferences();
+
+            if (previous || !active) {
+                active = true;
+
+                if (hasPermissions()) {
+                    scanSaved();
+                }
+            }
+        }
+
+        rebuildCurrentPage();
+
+        handler.removeCallbacks(servicePollTask);
+        handler.postDelayed(servicePollTask, 1000);
+    }
+
+    @Override
+    protected void onPause() {
+        handler.removeCallbacks(servicePollTask);
+        super.onPause();
+    }
+
+    private void rebuildCurrentPage() {
+        if (isFinishing() || isDestroyed()) return;
+
+        if (developerVisible) {
+            showDeveloperPage();
+        } else if (settingsVisible) {
+            showSettingsPage();
+        } else {
+            buildMainPage();
+            showMainPage();
+        }
     }
 
     private int fg() {
-        return dark ? Color.WHITE :
-            Color.rgb(40, 43, 49);
+        return dark
+            ? Color.WHITE
+            : Color.rgb(40, 43, 49);
     }
 
     private int muted() {
-        return dark ? Color.rgb(174, 179, 189) :
-            Color.rgb(112, 117, 125);
+        return dark
+            ? Color.rgb(174, 179, 189)
+            : Color.rgb(112, 117, 125);
     }
 
     private int bg() {
-        return dark ? Color.rgb(17, 19, 24) :
-            Color.rgb(250, 250, 251);
+        return dark
+            ? Color.rgb(17, 19, 24)
+            : Color.rgb(250, 250, 251);
     }
 
     private int surface() {
-        return dark ? Color.rgb(37, 40, 48) :
-            Color.rgb(233, 235, 239);
+        return dark
+            ? Color.rgb(37, 40, 48)
+            : Color.rgb(233, 235, 239);
     }
 
     private int accent() {
@@ -528,7 +616,9 @@ public class MainActivity extends Activity {
     }
 
     private TextView text(
-        String value, int size, int color
+        String value,
+        int size,
+        int color
     ) {
         TextView view = new TextView(this);
         view.setText(value);
@@ -540,15 +630,18 @@ public class MainActivity extends Activity {
     private LinearLayout column() {
         LinearLayout view = new LinearLayout(this);
         view.setOrientation(LinearLayout.VERTICAL);
+
         view.setPadding(
             dp(18), dp(18), dp(18), dp(18)
         );
+
         view.setBackgroundColor(bg());
         return view;
     }
 
     private void section(
-        LinearLayout parent, String title
+        LinearLayout parent,
+        String title
     ) {
         TextView view = text(title, 19, fg());
         view.setPadding(0, dp(22), 0, dp(10));
@@ -574,12 +667,11 @@ public class MainActivity extends Activity {
 
         params.bottomMargin = dp(9);
         parent.addView(view, params);
-        view.setOnClickListener(v -> action.run());
 
+        view.setOnClickListener(v -> action.run());
         return view;
     }
 
-    // Android 16 시스템 바 대응
     private void showPage(LinearLayout page) {
         if (page.getParent() != null) {
             ((ViewGroup)page.getParent()).removeView(page);
@@ -599,9 +691,12 @@ public class MainActivity extends Activity {
                         );
 
                     view.setPadding(
-                        bars.left, bars.top,
-                        bars.right, bars.bottom
+                        bars.left,
+                        bars.top,
+                        bars.right,
+                        bars.bottom
                     );
+
                     return insets;
                 }
             );
@@ -636,7 +731,6 @@ public class MainActivity extends Activity {
         showPage(developerPage);
     }
 
-    // 메인 화면
     private void buildMainPage() {
         mainRoot = column();
 
@@ -644,7 +738,11 @@ public class MainActivity extends Activity {
         header.setGravity(Gravity.CENTER_VERTICAL);
         mainRoot.addView(header);
 
-        TextView title = text("엠비언트 설정", 25, fg());
+        TextView title = text(
+            "엠비언트 설정",
+            25,
+            fg()
+        );
 
         header.addView(
             title,
@@ -656,7 +754,9 @@ public class MainActivity extends Activity {
         IconView settingsIcon =
             new IconView(this, false);
 
-        settingsIcon.setContentDescription("차량 연결 설정");
+        settingsIcon.setContentDescription(
+            "차량 연결 설정"
+        );
 
         header.addView(
             settingsIcon,
@@ -683,6 +783,13 @@ public class MainActivity extends Activity {
         );
 
         powerIcon.setOnClickListener(v -> {
+            if (phoneBusy()) {
+                toast(
+                    "스마트폰 순차점등을 먼저 중지하세요"
+                );
+                return;
+            }
+
             if (!connected) {
                 toast("차량 연결을 확인하세요");
                 return;
@@ -704,7 +811,9 @@ public class MainActivity extends Activity {
         });
 
         mainStatus = text(
-            "연결 상태 확인 중", 14, muted()
+            "연결 상태 확인 중",
+            14,
+            muted()
         );
 
         mainStatus.setPadding(
@@ -721,6 +830,7 @@ public class MainActivity extends Activity {
 
         colorTab.setText("색상");
         modeTab.setText("모드");
+
         colorTab.setAllCaps(false);
         modeTab.setAllCaps(false);
 
@@ -787,7 +897,6 @@ public class MainActivity extends Activity {
         updateStatusViews();
     }
 
-    // 색상 화면
     private void buildColorPage() {
         section(contentContainer, "색상표");
 
@@ -809,6 +918,7 @@ public class MainActivity extends Activity {
         colorLabel.setPadding(
             0, dp(10), 0, 0
         );
+
         contentContainer.addView(colorLabel);
 
         section(contentContainer, "색상 프리셋");
@@ -816,13 +926,15 @@ public class MainActivity extends Activity {
         contentContainer.addView(
             text(
                 "짧게 누르면 적용 · 길게 누르면 현재 색상 저장",
-                12, muted()
+                12,
+                muted()
             )
         );
 
         presetRow = new LinearLayout(this);
         presetRow.setPadding(0, dp(9), 0, 0);
         contentContainer.addView(presetRow);
+
         refreshPresets();
 
         section(contentContainer, "RGB");
@@ -869,17 +981,20 @@ public class MainActivity extends Activity {
         blueBar.setOnSeekBarChangeListener(listener);
 
         updateColorLabel();
-        wheel.setSelectedColor(Color.rgb(r, g, b));
+
+        wheel.setSelectedColor(
+            Color.rgb(r, g, b)
+        );
     }
 
-    // 모드 화면
     private void buildModePage() {
         section(contentContainer, "조명 효과");
 
         contentContainer.addView(
             text(
                 "컨트롤러 또는 개발자 모드에서 선택한 방식으로 실행합니다.",
-                14, muted()
+                14,
+                muted()
             )
         );
 
@@ -888,6 +1003,7 @@ public class MainActivity extends Activity {
         group.setPadding(
             0, dp(14), 0, dp(8)
         );
+
         contentContainer.addView(group);
 
         RadioButton seq = new RadioButton(this);
@@ -895,8 +1011,10 @@ public class MainActivity extends Activity {
 
         seq.setText("순차 점등");
         rainbow.setText("무지개 순환");
+
         seq.setTextColor(fg());
         rainbow.setTextColor(fg());
+
         seq.setId(2001);
         rainbow.setId(2002);
 
@@ -912,9 +1030,20 @@ public class MainActivity extends Activity {
         group.setOnCheckedChangeListener(
             (radioGroup, id) -> {
                 int next = id == 2001 ? 0 : 1;
+
                 if (selectedMode == next) return;
 
-                stopPhoneTask();
+                if (phoneBusy()) {
+                    toast(
+                        "스마트폰 순차점등을 먼저 중지하세요"
+                    );
+
+                    group.check(
+                        selectedMode == 0 ? 2001 : 2002
+                    );
+                    return;
+                }
+
                 selectedMode = next;
 
                 prefs().edit()
@@ -932,22 +1061,32 @@ public class MainActivity extends Activity {
         section(contentContainer, "전환 속도");
 
         speedLabel = text(
-            modeSpeed + "%", 15, muted()
+            modeSpeed + "%",
+            15,
+            muted()
         );
+
         contentContainer.addView(speedLabel);
 
         speedBar = new SeekBar(this);
         speedBar.setMax(99);
+
         speedBar.setProgress(
             Math.max(1, Math.min(100, modeSpeed)) - 1
         );
+
         contentContainer.addView(speedBar);
 
         LinearLayout hints = new LinearLayout(this);
         hints.setGravity(Gravity.CENTER_VERTICAL);
 
-        TextView slow = text("느리게", 13, muted());
-        TextView fast = text("빠르게", 13, muted());
+        TextView slow = text(
+            "느리게", 13, muted()
+        );
+
+        TextView fast = text(
+            "빠르게", 13, muted()
+        );
 
         hints.addView(
             slow,
@@ -957,13 +1096,7 @@ public class MainActivity extends Activity {
         );
 
         fast.setGravity(Gravity.RIGHT);
-
-        hints.addView(
-            fast,
-            new LinearLayout.LayoutParams(
-                0, -2, 1
-            )
-        );
+        hints.addView(fast);
 
         contentContainer.addView(hints);
 
@@ -985,14 +1118,7 @@ public class MainActivity extends Activity {
                     .putInt("mode_speed", modeSpeed)
                     .apply();
 
-                if (modeRunning &&
-                    selectedMode == 0 &&
-                    sequentialEngine == ENGINE_PHONE) {
-
-                    // HSV 진행 상태를 유지하면서 속도만 변경
-                    phoneLastTick = SystemClock.uptimeMillis();
-
-                } else {
+                if (!phoneBusy()) {
                     handler.removeCallbacks(speedTask);
                     handler.postDelayed(speedTask, 140);
                 }
@@ -1007,9 +1133,7 @@ public class MainActivity extends Activity {
             public void onStopTrackingTouch(
                 SeekBar bar
             ) {
-                if (!(modeRunning &&
-                      selectedMode == 0 &&
-                      sequentialEngine == ENGINE_PHONE)) {
+                if (!phoneBusy()) {
                     handler.removeCallbacks(speedTask);
                     handler.post(speedTask);
                 }
@@ -1018,7 +1142,8 @@ public class MainActivity extends Activity {
 
         modeStateLabel = text(
             "조명 효과 중지됨",
-            14, muted()
+            14,
+            muted()
         );
 
         modeStateLabel.setPadding(
@@ -1042,9 +1167,10 @@ public class MainActivity extends Activity {
         );
 
         TextView note = text(
-            "컨트롤러 효과는 앱 종료 후에도 유지될 수 있습니다. " +
-            "스마트폰 그라데이션은 앱과 BLE 연결이 필요합니다.",
-            12, muted()
+            "스마트폰 그라데이션은 백그라운드 서비스로 실행됩니다. " +
+            "알림창에서 컨트롤러 제어로 전환할 수 있습니다.",
+            12,
+            muted()
         );
 
         note.setPadding(
@@ -1052,25 +1178,30 @@ public class MainActivity extends Activity {
         );
 
         contentContainer.addView(note);
+
         updateModeUI();
     }
 
-    // 공통 밝기 조절
     private void buildBrightnessControl(
         LinearLayout parent
     ) {
         section(parent, "밝기 조절");
 
         brightnessLabel = text(
-            brightness + "%", 15, muted()
+            brightness + "%",
+            15,
+            muted()
         );
+
         parent.addView(brightnessLabel);
 
         brightnessBar = new SeekBar(this);
         brightnessBar.setMax(99);
+
         brightnessBar.setProgress(
             Math.max(1, Math.min(100, brightness)) - 1
         );
+
         parent.addView(brightnessBar);
 
         brightnessBar.setOnSeekBarChangeListener(
@@ -1084,7 +1215,12 @@ public class MainActivity extends Activity {
             ) {
                 if (!fromUser) return;
 
+                if (phoneBusy()) {
+                    return;
+                }
+
                 brightness = progress + 1;
+
                 brightnessLabel.setText(
                     brightness + "%"
                 );
@@ -1094,8 +1230,10 @@ public class MainActivity extends Activity {
                     .apply();
 
                 handler.removeCallbacks(brightnessTask);
+
                 handler.postDelayed(
-                    brightnessTask, 120
+                    brightnessTask,
+                    120
                 );
             }
 
@@ -1108,14 +1246,26 @@ public class MainActivity extends Activity {
             public void onStopTrackingTouch(
                 SeekBar bar
             ) {
+                if (phoneBusy()) {
+                    bar.setProgress(brightness - 1);
+                    toast(
+                        "스마트폰 순차점등을 먼저 중지하세요"
+                    );
+                    return;
+                }
+
                 handler.removeCallbacks(brightnessTask);
                 handler.post(brightnessTask);
             }
         });
     }
 
-    // 효과 시작
     private void startMode() {
+        if (phoneBusy()) {
+            toast("스마트폰 순차점등이 이미 실행 중입니다");
+            return;
+        }
+
         if (!connected) {
             toast("차량을 먼저 연결하세요");
             return;
@@ -1123,6 +1273,13 @@ public class MainActivity extends Activity {
 
         if (!powerOn) {
             toast("조명 전원을 먼저 켜세요");
+            return;
+        }
+
+        if (selectedMode == 0 &&
+            sequentialEngine == ENGINE_PHONE) {
+
+            startPhoneService();
             return;
         }
 
@@ -1134,37 +1291,123 @@ public class MainActivity extends Activity {
         updateModeUI();
     }
 
-    private void sendModeCommand() {
-        if (!connected) return;
+    private void startPhoneService() {
+        if (phoneBusy()) return;
 
-        stopPhoneTask();
-        handler.removeCallbacks(speedTask);
+        if (!hasPermissions()) {
+            requestNeededPermissions();
+            return;
+        }
 
-        if (selectedMode == 0 &&
-            sequentialEngine == ENGINE_PHONE) {
+        if (savedAddress.isEmpty()) {
+            toast("등록된 차량이 없습니다");
+            return;
+        }
 
-            // 기존 컨트롤러 효과를 RGB 명령으로 전환
-            send(rgbPacket(255, 0, 0));
-            startPhoneTask();
+        active = false;
+        disconnect();
 
-        } else {
-            byte[] packet;
+        phoneServiceActive = true;
+        phoneStopPending = false;
+        modeRunning = true;
 
-            if (selectedMode == 1 ||
-                (selectedMode == 0 &&
-                 sequentialEngine == ENGINE_RAINBOW)) {
-                packet = RAINBOW;
+        prefs().edit()
+            .putInt("selected_mode", 0)
+            .putInt("sequential_engine", ENGINE_PHONE)
+            .putBoolean("mode_running", true)
+            .putBoolean("phone_service_active", true)
+            .apply();
+
+        Intent intent = new Intent(
+            this,
+            SequentialBleService.class
+        );
+
+        intent.setAction(
+            SequentialBleService.ACTION_START
+        );
+
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(intent);
             } else {
-                packet = SEQUENTIAL;
+                startService(intent);
             }
 
-            send(packet);
-            handler.postDelayed(speedTask, 240);
+            setStatus("스마트폰 순차점등 연결 중");
+        } catch (Exception e) {
+            phoneServiceActive = false;
+            modeRunning = false;
+
+            prefs().edit()
+                .putBoolean("phone_service_active", false)
+                .putBoolean("mode_running", false)
+                .apply();
+
+            active = true;
+            scanSaved();
+
+            toast("백그라운드 서비스 시작 실패");
         }
+
+        updateModeUI();
+    }
+
+    private void stopPhoneService() {
+        if (!phoneServiceActive || phoneStopPending) {
+            return;
+        }
+
+        phoneStopPending = true;
+
+        Intent intent = new Intent(
+            this,
+            SequentialBleService.class
+        );
+
+        intent.setAction(
+            SequentialBleService.ACTION_STOP
+        );
+
+        try {
+            startService(intent);
+
+            setStatus("컨트롤러 제어로 전환 중...");
+            toast("컨트롤러 제어로 전환 중");
+        } catch (Exception e) {
+            phoneStopPending = false;
+            toast("서비스 중지 요청 실패");
+        }
+
+        updateModeUI();
+    }
+
+    private void sendModeCommand() {
+        if (!connected || phoneBusy()) return;
+
+        handler.removeCallbacks(speedTask);
+
+        byte[] packet;
+
+        if (selectedMode == 1 ||
+            (selectedMode == 0 &&
+             sequentialEngine == ENGINE_RAINBOW)) {
+            packet = RAINBOW;
+        } else {
+            packet = SEQUENTIAL;
+        }
+
+        send(packet);
+        handler.postDelayed(speedTask, 240);
     }
 
     private void stopMode() {
         if (!modeRunning) return;
+
+        if (phoneServiceActive) {
+            stopPhoneService();
+            return;
+        }
 
         stopModeLocal();
 
@@ -1174,9 +1417,11 @@ public class MainActivity extends Activity {
     }
 
     private void stopModeLocal() {
+        if (phoneBusy()) return;
+
         modeRunning = false;
         saveModeRunning();
-        stopPhoneTask();
+
         handler.removeCallbacks(speedTask);
         updateModeUI();
     }
@@ -1206,16 +1451,25 @@ public class MainActivity extends Activity {
     private void updateModeUI() {
         if (modeButton != null) {
             modeButton.setText(
-                modeRunning
-                    ? "조명 효과 중지"
-                    : "조명 효과 시작"
+                phoneStopPending
+                    ? "컨트롤러 전환 중..."
+                    : modeRunning
+                        ? "조명 효과 중지"
+                        : "조명 효과 시작"
             );
+
+            modeButton.setEnabled(!phoneStopPending);
         }
 
         if (modeStateLabel != null) {
+            String state = phoneStopPending
+                ? " · 컨트롤러 전환 중"
+                : modeRunning
+                    ? " 실행 중"
+                    : " 중지됨";
+
             modeStateLabel.setText(
-                engineName() +
-                (modeRunning ? " 실행 중" : " 중지됨")
+                engineName() + state
             );
 
             modeStateLabel.setTextColor(
@@ -1226,7 +1480,9 @@ public class MainActivity extends Activity {
         if (developerState != null) {
             developerState.setText(
                 engineName() +
-                (modeRunning ? " · 실행 중" : " · 중지됨")
+                (modeRunning
+                    ? " · 실행 중"
+                    : " · 중지됨")
             );
 
             developerState.setTextColor(
@@ -1236,7 +1492,15 @@ public class MainActivity extends Activity {
 
         if (developerStartButton != null) {
             developerStartButton.setText(
-                modeRunning ? "효과 중지" : "효과 시작"
+                phoneStopPending
+                    ? "전환 중..."
+                    : modeRunning
+                        ? "효과 중지"
+                        : "효과 시작"
+            );
+
+            developerStartButton.setEnabled(
+                !phoneStopPending
             );
         }
     }
@@ -1257,10 +1521,19 @@ public class MainActivity extends Activity {
     }
 
     private void setColor(
-        int nr, int ng, int nb,
+        int nr,
+        int ng,
+        int nb,
         boolean fromWheel,
         boolean manual
     ) {
+        if (phoneBusy()) {
+            toast(
+                "스마트폰 순차점등을 먼저 중지하세요"
+            );
+            return;
+        }
+
         if (manual && modeRunning) {
             stopModeLocal();
         }
@@ -1271,14 +1544,18 @@ public class MainActivity extends Activity {
 
         if (fromWheel && redBar != null) {
             updating = true;
+
             redBar.setProgress(r);
             greenBar.setProgress(g);
             blueBar.setProgress(b);
+
             updating = false;
         }
 
         if (!fromWheel && wheel != null) {
-            wheel.setSelectedColor(Color.rgb(r, g, b));
+            wheel.setSelectedColor(
+                Color.rgb(r, g, b)
+            );
         }
 
         updateColorLabel();
@@ -1305,18 +1582,19 @@ public class MainActivity extends Activity {
             )
         );
 
-        colorLabel.setTextColor(Color.rgb(r, g, b));
+        colorLabel.setTextColor(
+            Color.rgb(r, g, b)
+        );
     }
 
     private void queueColor() {
         handler.removeCallbacks(colorTask);
 
-        if (!modeRunning) {
+        if (!modeRunning && !phoneBusy()) {
             handler.postDelayed(colorTask, 100);
         }
     }
 
-    // 프리셋
     private void refreshPresets() {
         if (presetRow == null) return;
 
@@ -1347,6 +1625,13 @@ public class MainActivity extends Activity {
             presetRow.addView(swatch, params);
 
             swatch.setOnClickListener(v -> {
+                if (phoneBusy()) {
+                    toast(
+                        "스마트폰 순차점등을 먼저 중지하세요"
+                    );
+                    return;
+                }
+
                 if (!presetSaved[index]) {
                     toast("길게 눌러 색상을 저장하세요");
                     return;
@@ -1401,7 +1686,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // 설정 화면
     private void buildSettingsPage() {
         settingsPage = column();
 
@@ -1423,7 +1707,9 @@ public class MainActivity extends Activity {
             "메인 화면으로 돌아가기"
         );
 
-        back.setOnClickListener(v -> showMainPage());
+        back.setOnClickListener(
+            v -> showMainPage()
+        );
 
         header.addView(
             text("차량 연결 설정", 24, fg())
@@ -1431,19 +1717,38 @@ public class MainActivity extends Activity {
 
         section(settingsPage, "블루투스 연결 상태");
 
-        settingsStatus = text("", 19, accent());
+        settingsStatus = text(
+            "",
+            19,
+            accent()
+        );
+
         settingsStatus.setPadding(
             0, dp(6), 0, dp(8)
         );
+
         settingsPage.addView(settingsStatus);
 
-        settingsDevice = text("", 14, muted());
+        settingsDevice = text(
+            "",
+            14,
+            muted()
+        );
+
         settingsDevice.setPadding(
             0, 0, 0, dp(14)
         );
+
         settingsPage.addView(settingsDevice);
 
         button(settingsPage, "차량 연결", () -> {
+            if (phoneBusy()) {
+                toast(
+                    "스마트폰 순차점등을 먼저 중지하세요"
+                );
+                return;
+            }
+
             if (connected) {
                 toast("이미 연결되어 있습니다");
                 return;
@@ -1474,8 +1779,10 @@ public class MainActivity extends Activity {
 
         light.setText("라이트 모드");
         darkButton.setText("다크 모드");
+
         light.setTextColor(fg());
         darkButton.setTextColor(fg());
+
         light.setId(1001);
         darkButton.setId(1002);
 
@@ -1491,6 +1798,7 @@ public class MainActivity extends Activity {
         themes.setOnCheckedChangeListener(
             (group, id) -> {
                 boolean next = id == 1002;
+
                 if (next == dark) return;
 
                 dark = next;
@@ -1505,15 +1813,17 @@ public class MainActivity extends Activity {
         );
 
         TextView note = text(
-            "선택한 테마, 조명 색상, 밝기와 " +
-            "모드 속도는 앱을 종료해도 저장됩니다. " +
-            "이전에 등록한 차량은 앱 실행 시 자동 연결합니다.",
-            13, muted()
+            "선택한 테마, 조명 색상, 밝기와 모드 속도는 " +
+            "앱을 종료해도 저장됩니다. " +
+            "스마트폰 순차점등은 백그라운드 서비스로 실행됩니다.",
+            13,
+            muted()
         );
 
         note.setPadding(
             0, dp(14), 0, 0
         );
+
         settingsPage.addView(note);
 
         section(settingsPage, "고급 설정");
@@ -1527,7 +1837,6 @@ public class MainActivity extends Activity {
         updateStatusViews();
     }
 
-    // 개발자 모드 비밀번호
     private void showDeveloperPassword() {
         EditText input = new EditText(this);
         input.setSingleLine(true);
@@ -1566,7 +1875,6 @@ public class MainActivity extends Activity {
             .show();
     }
 
-    // 개발자 모드
     private void buildDeveloperPage() {
         developerPage = column();
 
@@ -1600,10 +1908,11 @@ public class MainActivity extends Activity {
         developerPage.addView(
             text(
                 "컨트롤러 자체 실행은 기존 v0.9 방식입니다. " +
-                "전체 색상 그라데이션은 스마트폰이 RGB 색상을 " +
-                "연속 전송합니다. 흐르는 무지개는 컨트롤러의 " +
-                "기존 무지개 효과를 사용합니다.",
-                13, muted()
+                "전체 색상 그라데이션은 스마트폰 백그라운드 서비스가 " +
+                "RGB 색상을 연속 전송합니다. " +
+                "흐르는 무지개는 컨트롤러 효과를 사용합니다.",
+                13,
+                muted()
             )
         );
 
@@ -1654,6 +1963,21 @@ public class MainActivity extends Activity {
 
         engine.setOnCheckedChangeListener(
             (group, id) -> {
+                if (phoneBusy()) {
+                    toast(
+                        "스마트폰 순차점등을 먼저 중지하세요"
+                    );
+
+                    group.check(
+                        sequentialEngine == ENGINE_PHONE
+                            ? 3002
+                            : sequentialEngine == ENGINE_RAINBOW
+                                ? 3003
+                                : 3001
+                    );
+                    return;
+                }
+
                 int next;
 
                 if (id == 3002) {
@@ -1666,9 +1990,7 @@ public class MainActivity extends Activity {
 
                 if (next == sequentialEngine) return;
 
-                boolean wasRunning = modeRunning;
-
-                if (wasRunning) {
+                if (modeRunning) {
                     stopModeLocal();
                 }
 
@@ -1684,7 +2006,6 @@ public class MainActivity extends Activity {
                     .apply();
 
                 updateModeUI();
-
                 toast("실행 방식 변경 완료");
             }
         );
@@ -1692,7 +2013,9 @@ public class MainActivity extends Activity {
         section(developerPage, "효과 직접 실행");
 
         developerState = text(
-            "", 15, muted()
+            "",
+            15,
+            muted()
         );
 
         developerState.setPadding(
@@ -1725,20 +2048,23 @@ public class MainActivity extends Activity {
             text(
                 "1%는 느리게, 100%는 빠르게 작동합니다. " +
                 "스마트폰 그라데이션은 약 8~120초에 " +
-                "색상환 한 바퀴를 순환하도록 설정됩니다.",
-                13, muted()
+                "색상환 한 바퀴를 순환합니다.",
+                13,
+                muted()
             )
         );
 
         TextView devSpeedLabel = text(
             "속도: " + modeSpeed + "%",
-            15, fg()
+            15,
+            fg()
         );
 
         developerPage.addView(devSpeedLabel);
 
         SeekBar devSpeedBar = new SeekBar(this);
         devSpeedBar.setMax(99);
+
         devSpeedBar.setProgress(
             Math.max(1, Math.min(100, modeSpeed)) - 1
         );
@@ -1762,26 +2088,11 @@ public class MainActivity extends Activity {
                     "속도: " + modeSpeed + "%"
                 );
 
-                if (speedBar != null) {
-                    speedBar.setProgress(modeSpeed - 1);
-                }
-
-                if (speedLabel != null) {
-                    speedLabel.setText(modeSpeed + "%");
-                }
-
                 prefs().edit()
                     .putInt("mode_speed", modeSpeed)
                     .apply();
 
-                if (modeRunning &&
-                    selectedMode == 0 &&
-                    sequentialEngine == ENGINE_PHONE) {
-
-                    phoneLastTick =
-                        SystemClock.uptimeMillis();
-
-                } else {
+                if (!phoneBusy()) {
                     handler.removeCallbacks(speedTask);
                     handler.postDelayed(speedTask, 140);
                 }
@@ -1796,9 +2107,7 @@ public class MainActivity extends Activity {
             public void onStopTrackingTouch(
                 SeekBar bar
             ) {
-                if (!(modeRunning &&
-                      selectedMode == 0 &&
-                      sequentialEngine == ENGINE_PHONE)) {
+                if (!phoneBusy()) {
                     handler.removeCallbacks(speedTask);
                     handler.post(speedTask);
                 }
@@ -1812,10 +2121,10 @@ public class MainActivity extends Activity {
 
         developerPage.addView(
             text(
-                "실험용: 0~255. 기존 속도 슬라이더는 " +
-                "1~100을 사용합니다. 컨트롤러의 실제 " +
+                "실험용: 0~255. 컨트롤러의 실제 " +
                 "지원 범위는 확인되지 않았습니다.",
-                13, muted()
+                13,
+                muted()
             )
         );
 
@@ -1826,7 +2135,8 @@ public class MainActivity extends Activity {
 
         TextView rawLabel = text(
             "원시값: " + rawBar.getProgress(),
-            15, fg()
+            15,
+            fg()
         );
 
         developerPage.addView(rawLabel);
@@ -1860,10 +2170,7 @@ public class MainActivity extends Activity {
             developerPage,
             "원시 속도값 전송",
             () -> {
-                if (!connected) {
-                    toast("차량을 먼저 연결하세요");
-                    return;
-                }
+                if (!canSendManualCommand()) return;
 
                 send(
                     rawSpeedPacket(
@@ -1881,9 +2188,9 @@ public class MainActivity extends Activity {
         developerPage.addView(
             text(
                 "공백 없이 16진수로 입력하거나 " +
-                "바이트 사이에 공백을 넣을 수 있습니다. " +
-                "잘못된 명령은 조명 상태를 바꿀 수 있습니다.",
-                13, muted()
+                "바이트 사이에 공백을 넣을 수 있습니다.",
+                13,
+                muted()
             )
         );
 
@@ -1907,10 +2214,7 @@ public class MainActivity extends Activity {
             developerPage,
             "HEX 전송",
             () -> {
-                if (!connected) {
-                    toast("차량을 먼저 연결하세요");
-                    return;
-                }
+                if (!canSendManualCommand()) return;
 
                 String value =
                     hexInput.getText()
@@ -1961,7 +2265,8 @@ public class MainActivity extends Activity {
             logBuffer.length() == 0
                 ? "전송 기록 없음"
                 : logBuffer.toString(),
-            12, muted()
+            12,
+            muted()
         );
 
         developerLog.setTextIsSelectable(true);
@@ -1979,13 +2284,26 @@ public class MainActivity extends Activity {
         updateModeUI();
     }
 
-    private void sendTest(byte[] packet) {
-        if (!connected) {
-            toast("차량을 먼저 연결하세요");
-            return;
+    private boolean canSendManualCommand() {
+        if (phoneBusy()) {
+            toast(
+                "스마트폰 순차점등을 먼저 중지하세요"
+            );
+            return false;
         }
 
-        send(packet);
+        if (!connected) {
+            toast("차량을 먼저 연결하세요");
+            return false;
+        }
+
+        return true;
+    }
+
+    private void sendTest(byte[] packet) {
+        if (canSendManualCommand()) {
+            send(packet);
+        }
     }
 
     private void log(String message) {
@@ -2005,18 +2323,23 @@ public class MainActivity extends Activity {
 
         if (logBuffer.length() > 8000) {
             logBuffer.delete(
-                0, logBuffer.length() - 6000
+                0,
+                logBuffer.length() - 6000
             );
         }
 
         if (developerVisible && developerLog != null) {
-            developerLog.setText(logBuffer.toString());
+            developerLog.setText(
+                logBuffer.toString()
+            );
         }
     }
 
     private void toast(String message) {
         Toast.makeText(
-            this, message, Toast.LENGTH_SHORT
+            this,
+            message,
+            Toast.LENGTH_SHORT
         ).show();
     }
 
@@ -2057,7 +2380,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // BLE 권한
     private boolean hasPermissions() {
         if (Build.VERSION.SDK_INT >= 31) {
             return
@@ -2101,18 +2423,31 @@ public class MainActivity extends Activity {
         int[] results
     ) {
         super.onRequestPermissionsResult(
-            code, permissions, results
+            code,
+            permissions,
+            results
         );
 
         if (hasPermissions()) {
-            startAuto();
+            if (!phoneBusy()) {
+                startAuto();
+            }
         } else {
-            setStatus("근처 기기 권한을 허용하세요");
+            setStatus(
+                "근처 기기 권한을 허용하세요"
+            );
         }
     }
 
-    // 자동 연결
     private void startAuto() {
+        if (phoneBusy() || isPhoneServiceActive()) {
+            active = false;
+            setStatus(
+                "스마트폰 순차점등 실행 중"
+            );
+            return;
+        }
+
         active = true;
 
         if (savedAddress.isEmpty()) {
@@ -2126,6 +2461,8 @@ public class MainActivity extends Activity {
 
     private void scanSaved() {
         if (!active ||
+            phoneBusy() ||
+            isPhoneServiceActive() ||
             choosing ||
             scanning ||
             connected ||
@@ -2159,15 +2496,23 @@ public class MainActivity extends Activity {
             setStatus("이전 차량 검색 중...");
 
             handler.removeCallbacks(timeoutTask);
-            handler.postDelayed(timeoutTask, 10000);
-
+            handler.postDelayed(
+                timeoutTask,
+                10000
+            );
         } catch (SecurityException e) {
             setStatus("블루투스 권한 오류");
         }
     }
 
-    // 다른 차량 선택
     private void startDevicePicker() {
+        if (phoneBusy()) {
+            toast(
+                "스마트폰 순차점등을 먼저 중지하세요"
+            );
+            return;
+        }
+
         if (!hasPermissions()) {
             requestNeededPermissions();
             return;
@@ -2199,8 +2544,10 @@ public class MainActivity extends Activity {
             setStatus("주변 BLE 기기 검색 중...");
 
             handler.removeCallbacks(timeoutTask);
-            handler.postDelayed(timeoutTask, 8000);
-
+            handler.postDelayed(
+                timeoutTask,
+                8000
+            );
         } catch (SecurityException e) {
             choosing = false;
             setStatus("권한 오류");
@@ -2258,7 +2605,10 @@ public class MainActivity extends Activity {
                         name.lastIndexOf(" · ");
 
                     if (separator >= 0) {
-                        name = name.substring(0, separator);
+                        name = name.substring(
+                            0,
+                            separator
+                        );
                     }
 
                     connect(device, name);
@@ -2273,13 +2623,19 @@ public class MainActivity extends Activity {
     }
 
     private void connect(
-        BluetoothDevice device, String name
+        BluetoothDevice device,
+        String name
     ) {
-        if (connected || connecting) return;
+        if (connected ||
+            connecting ||
+            phoneBusy()) {
+            return;
+        }
 
         stopScan();
         choosing = false;
         disconnect();
+
         connecting = true;
 
         if (name != null) {
@@ -2309,7 +2665,8 @@ public class MainActivity extends Activity {
     }
 
     private void lost(
-        BluetoothGatt current, String reason
+        BluetoothGatt current,
+        String reason
     ) {
         if (current != gatt) return;
 
@@ -2322,7 +2679,6 @@ public class MainActivity extends Activity {
         sending = false;
 
         handler.removeCallbacks(sendTask);
-        stopPhoneTask();
 
         try {
             current.close();
@@ -2353,8 +2709,6 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(speedTask);
         handler.removeCallbacks(sendTask);
 
-        stopPhoneTask();
-
         sendQueue.clear();
         sending = false;
 
@@ -2377,20 +2731,25 @@ public class MainActivity extends Activity {
         handler.removeCallbacks(retryTask);
 
         if (active &&
+            !phoneBusy() &&
+            !isPhoneServiceActive() &&
             !choosing &&
             !savedAddress.isEmpty() &&
             !connected &&
             !connecting) {
 
-            handler.postDelayed(retryTask, 4000);
+            handler.postDelayed(
+                retryTask,
+                4000
+            );
         }
     }
 
-    // BLE 명령 전송
     private void send(byte[] bytes) {
         if (!connected ||
             gatt == null ||
-            writeChar == null) {
+            writeChar == null ||
+            phoneBusy()) {
             return;
         }
 
@@ -2423,9 +2782,10 @@ public class MainActivity extends Activity {
         return out.toString();
     }
 
-    // v0.9 RGB 패킷
     private static byte[] rgbPacket(
-        int red, int green, int blue
+        int red,
+        int green,
+        int blue
     ) {
         return new byte[]{
             0x7B,
@@ -2442,7 +2802,10 @@ public class MainActivity extends Activity {
 
     private static byte[] speedPacket(int percent) {
         return rawSpeedPacket(
-            Math.max(1, Math.min(100, percent))
+            Math.max(
+                1,
+                Math.min(100, percent)
+            )
         );
     }
 
@@ -2460,12 +2823,13 @@ public class MainActivity extends Activity {
         };
     }
 
-    // v0.9 밝기 패킷
     private static byte[] brightnessPacket(
         int percent
     ) {
-        int value =
-            Math.max(1, Math.min(100, percent));
+        int value = Math.max(
+            1,
+            Math.min(100, percent)
+        );
 
         return new byte[]{
             0x7B,
@@ -2481,7 +2845,8 @@ public class MainActivity extends Activity {
     }
 
     private static byte[] hex(String value) {
-        byte[] bytes = new byte[value.length() / 2];
+        byte[] bytes =
+            new byte[value.length() / 2];
 
         for (int i = 0; i < bytes.length; i++) {
             bytes[i] = (byte)Integer.parseInt(
@@ -2510,13 +2875,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         active = false;
-        stopPhoneTask();
+
+        // 백그라운드 서비스는 종료하지 않는다.
         disconnect();
+
         handler.removeCallbacksAndMessages(null);
+
         super.onDestroy();
     }
 
-    // 전원 / 설정 / 뒤로 가기 아이콘
     private class IconView extends View {
 
         private final Paint paint =
@@ -2535,8 +2902,10 @@ public class MainActivity extends Activity {
             boolean back
         ) {
             super(context);
+
             isPower = power;
             isBack = back;
+
             setClickable(true);
         }
 
@@ -2548,7 +2917,10 @@ public class MainActivity extends Activity {
             float cy = getHeight() / 2f;
 
             float radius =
-                Math.min(getWidth(), getHeight()) * 0.22f;
+                Math.min(
+                    getWidth(),
+                    getHeight()
+                ) * 0.22f;
 
             paint.setColor(
                 isPower
@@ -2557,6 +2929,7 @@ public class MainActivity extends Activity {
             );
 
             paint.setStyle(Paint.Style.STROKE);
+
             paint.setStrokeWidth(
                 getResources()
                     .getDisplayMetrics()
@@ -2606,13 +2979,15 @@ public class MainActivity extends Activity {
 
             } else {
                 canvas.drawCircle(
-                    cx, cy,
+                    cx,
+                    cy,
                     radius * 0.86f,
                     paint
                 );
 
                 canvas.drawCircle(
-                    cx, cy,
+                    cx,
+                    cy,
                     radius * 0.31f,
                     paint
                 );
@@ -2640,11 +3015,14 @@ public class MainActivity extends Activity {
         }
     }
 
-    // HSV 컬러휠
     private static class ColorWheel extends View {
 
         interface Listener {
-            void onColorChange(int r, int g, int b);
+            void onColorChange(
+                int r,
+                int g,
+                int b
+            );
         }
 
         private Listener listener;
@@ -2670,16 +3048,22 @@ public class MainActivity extends Activity {
 
             hue = hsv[0];
             saturation = hsv[1];
+
             invalidate();
         }
 
         @Override
         protected void onSizeChanged(
-            int width, int height,
-            int oldWidth, int oldHeight
+            int width,
+            int height,
+            int oldWidth,
+            int oldHeight
         ) {
             super.onSizeChanged(
-                width, height, oldWidth, oldHeight
+                width,
+                height,
+                oldWidth,
+                oldHeight
             );
 
             if (bitmap != null) {
@@ -2690,7 +3074,8 @@ public class MainActivity extends Activity {
             if (size <= 0) return;
 
             bitmap = Bitmap.createBitmap(
-                size, size,
+                size,
+                size,
                 Bitmap.Config.ARGB_8888
             );
 
@@ -2737,15 +3122,19 @@ public class MainActivity extends Activity {
 
             bitmap.setPixels(
                 pixels,
-                0, size,
-                0, 0,
-                size, size
+                0,
+                size,
+                0,
+                0,
+                size,
+                size
             );
         }
 
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
+
             if (bitmap == null) return;
 
             float size = bitmap.getWidth();
@@ -2757,7 +3146,10 @@ public class MainActivity extends Activity {
                 (getHeight() - size) / 2f;
 
             canvas.drawBitmap(
-                bitmap, left, top, paint
+                bitmap,
+                left,
+                top,
+                paint
             );
 
             float radians =
@@ -2784,14 +3176,20 @@ public class MainActivity extends Activity {
             paint.setColor(Color.BLACK);
 
             canvas.drawCircle(
-                x, y, 12f * density, paint
+                x,
+                y,
+                12f * density,
+                paint
             );
 
             paint.setStrokeWidth(3f);
             paint.setColor(Color.WHITE);
 
             canvas.drawCircle(
-                x, y, 14f * density, paint
+                x,
+                y,
+                14f * density,
+                paint
             );
 
             paint.setStyle(Paint.Style.FILL);
@@ -2807,7 +3205,10 @@ public class MainActivity extends Activity {
             }
 
             float size =
-                Math.min(getWidth(), getHeight());
+                Math.min(
+                    getWidth(),
+                    getHeight()
+                );
 
             float dx =
                 event.getX() - getWidth() / 2f;
