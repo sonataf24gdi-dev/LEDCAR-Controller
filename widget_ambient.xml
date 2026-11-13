@@ -1,130 +1,151 @@
 
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout
+
+<FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="#BF17191F"
-    android:padding="10dp">
+    android:layout_height="match_parent">
 
+    <!-- 투명도 조절용 배경 -->
+    <ImageView
+        android:id="@+id/widget_background"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitXY"
+        android:contentDescription="@null" />
+
+    <!-- 위젯 전체 내용 -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="30dp"
-        android:orientation="horizontal"
-        android:gravity="center_vertical">
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:padding="10dp">
 
-        <TextView
-            android:id="@+id/widget_title"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
+        <!-- 상단 제목과 연결 상태 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="30dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/widget_title"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:text="엠비언트 설정"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/widget_status"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:gravity="center_vertical"
+                android:text="● 대기"
+                android:textColor="#14C7AD"
+                android:textSize="11sp" />
+
+        </LinearLayout>
+
+        <!-- 색상 프리셋 6개 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
             android:layout_weight="1"
-            android:gravity="center_vertical"
-            android:text="엠비언트 설정"
-            android:textColor="#FFFFFF"
-            android:textSize="15sp"
-            android:textStyle="bold"/>
+            android:orientation="horizontal"
+            android:gravity="center">
 
-        <TextView
-            android:id="@+id/widget_status"
-            android:layout_width="wrap_content"
-            android:layout_height="match_parent"
-            android:gravity="center_vertical"
-            android:text="● 대기"
-            android:textColor="#14C7AD"
-            android:textSize="11sp"/>
+            <ImageView
+                android:id="@+id/preset_0"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:padding="3dp" />
+
+            <ImageView
+                android:id="@+id/preset_1"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:padding="3dp" />
+
+            <ImageView
+                android:id="@+id/preset_2"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:padding="3dp" />
+
+            <ImageView
+                android:id="@+id/preset_3"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:padding="3dp" />
+
+            <ImageView
+                android:id="@+id/preset_4"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:padding="3dp" />
+
+            <ImageView
+                android:id="@+id/preset_5"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:padding="3dp" />
+
+        </LinearLayout>
+
+        <!-- 하단 제어 버튼 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="46dp"
+            android:orientation="horizontal"
+            android:gravity="center">
+
+            <TextView
+                android:id="@+id/widget_sequential"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:gravity="center"
+                android:background="#292D35"
+                android:text="순차 점등"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/widget_rainbow"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:layout_marginEnd="4dp"
+                android:gravity="center"
+                android:background="#292D35"
+                android:text="무지개 순환"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/widget_power"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="0.7"
+                android:gravity="center"
+                android:background="#0C9F8B"
+                android:text="⏻ 전원"
+                android:textColor="#FFFFFF"
+                android:textSize="11sp" />
+
+        </LinearLayout>
+
     </LinearLayout>
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:orientation="horizontal"
-        android:gravity="center">
-
-        <ImageView
-            android:id="@+id/preset_0"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:padding="3dp"/>
-
-        <ImageView
-            android:id="@+id/preset_1"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:padding="3dp"/>
-
-        <ImageView
-            android:id="@+id/preset_2"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:padding="3dp"/>
-
-        <ImageView
-            android:id="@+id/preset_3"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:padding="3dp"/>
-
-        <ImageView
-            android:id="@+id/preset_4"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:padding="3dp"/>
-
-        <ImageView
-            android:id="@+id/preset_5"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:padding="3dp"/>
-    </LinearLayout>
-
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="46dp"
-        android:orientation="horizontal"
-        android:gravity="center">
-
-        <TextView
-            android:id="@+id/widget_sequential"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:layout_marginEnd="4dp"
-            android:gravity="center"
-            android:background="#292D35"
-            android:text="순차 점등"
-            android:textColor="#FFFFFF"
-            android:textSize="11sp"/>
-
-        <TextView
-            android:id="@+id/widget_rainbow"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:layout_marginEnd="4dp"
-            android:gravity="center"
-            android:background="#292D35"
-            android:text="무지개 순환"
-            android:textColor="#FFFFFF"
-            android:textSize="11sp"/>
-
-        <TextView
-            android:id="@+id/widget_power"
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="0.7"
-            android:gravity="center"
-            android:background="#0C9F8B"
-            android:text="⏻ 전원"
-            android:textColor="#FFFFFF"
-            android:textSize="11sp"/>
-    </LinearLayout>
-</LinearLayout>
-
+</FrameLayout>
