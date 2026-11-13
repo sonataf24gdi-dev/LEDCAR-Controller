@@ -29,101 +29,248 @@ import java.util.UUID;
 public class WidgetBleService extends Service {
 
     private static final UUID SERVICE_UUID =
-            UUID.fromString(
-                    "0000ffe0-0000-1000-8000-00805f9b34fb"
-            );
+        UUID.fromString(
+            "0000ffe0-0000-1000-8000-00805f9b34fb"
+        );
 
     private static final UUID CHAR_UUID =
-            UUID.fromString(
-                    "0000ffe1-0000-1000-8000-00805f9b34fb"
-            );
+        UUID.fromString(
+            "0000ffe1-0000-1000-8000-00805f9b34fb"
+        );
 
     private static final String CHANNEL_ID =
-            "ambient_widget_ble";
+        "ambient_widget_ble";
+
+    private static final int NOTIFICATION_ID = 41;
+
+    private static final byte[] ON =
+        hex("7BFF0407FFFFFFFFBF");
+
+    private static final byte[] OFF =
+        hex("7BFF0406FFFFFFFFBF");
+
+    private static final byte[] SEQUENTIAL =
+        hex("7BFF0351FFFFFFFFBF");
+
+    private static final byte[] RAINBOW =
+        hex("7BFF0301FFFFFFFFBF");
 
     private final Handler handler =
-            new Handler(Looper.getMainLooper());
+        new Handler(Looper.getMainLooper());
 
-    private final ArrayDeque<byte[]> queue =
-            new ArrayDeque<>();
+    private final ArrayDeque<Intent> commands =
+        new ArrayDeque<>();
+
+    private final ArrayDeque<byte[]> packets =
+        new ArrayDeque<>();
 
     private BluetoothGatt gatt;
-    private BluetoothGattCharacteristic characteristic;
+    private BluetoothGattCharacteristic writeChar;
 
-    private boolean busy = false;
-    private boolean finished = false;
-    private int startId;
+    private boolean busy;
+    private boolean finished;
+    private boolean waitingWrite;
+    private boolean lastWriteNoResponse;
+
+    private int latestStartId;
+    private int pendingIndex = -1;
+    private String pendingCommand = "";
 
     private final Runnable timeout = () -> {
         setStatus("연결 실패");
-        finishCommand();
+        finishCurrent(false);
+    };
+
+    private final Runnable writeTimeout = () -> {
+        if (waitingWrite) {
+            setStatus("전송 시간 초과");
+            finishCurrent(false);
+        }
     };
 
     private final Runnable writer = new Runnable() {
         @Override
         public void run() {
 
-            if (finished || gatt == null ||
-                    characteristic == null) {
+            if (finished || !busy ||
+                gatt == null || writeChar == null ||
+                waitingWrite) {
                 return;
             }
 
-            byte[] packet = queue.poll();
+            byte[] packet = packets.poll();
 
             if (packet == null) {
-                setStatus("대기");
-                finishCommand();
+                setStatus("명령 전송 완료");
+                finishCurrent(true);
                 return;
             }
 
+            int properties = writeChar.getProperties();
+
+            int writeType =
+                (properties &
+                BluetoothGattCharacteristic
+                    .PROPERTY_WRITE_NO_RESPONSE) != 0
+                ? BluetoothGattCharacteristic
+                    .WRITE_TYPE_NO_RESPONSE
+                : BluetoothGattCharacteristic
+                    .WRITE_TYPE_DEFAULT;
+
+            lastWriteNoResponse =
+                writeType ==
+                BluetoothGattCharacteristic
+                    .WRITE_TYPE_NO_RESPONSE;
+
             try {
-                int properties =
-                        characteristic.getProperties();
-
-                int writeType =
-                        (properties &
-                                BluetoothGattCharacteristic
-                                        .PROPERTY_WRITE_NO_RESPONSE) != 0
-                                ? BluetoothGattCharacteristic
-                                        .WRITE_TYPE_NO_RESPONSE
-                                : BluetoothGattCharacteristic
-                                        .WRITE_TYPE_DEFAULT;
-
-                boolean success;
+                boolean accepted;
 
                 if (Build.VERSION.SDK_INT >= 33) {
-
                     int result = gatt.writeCharacteristic(
-                            characteristic,
-                            packet,
-                            writeType
+                        writeChar,
+                        packet,
+                        writeType
                     );
 
-                    success =
-                            result == BluetoothStatusCodes.SUCCESS;
+                    accepted =
+                        result == BluetoothStatusCodes.SUCCESS;
 
                 } else {
+                    writeChar.setWriteType(writeType);
+                    writeChar.setValue(packet);
 
-                    characteristic.setWriteType(writeType);
-                    characteristic.setValue(packet);
-
-                    success = gatt.writeCharacteristic(
-                            characteristic
-                    );
+                    accepted =
+                        gatt.writeCharacteristic(writeChar);
                 }
 
-                if (!success) {
+                if (!accepted) {
                     setStatus("전송 실패");
-                    finishCommand();
+                    finishCurrent(false);
                     return;
                 }
 
-                handler.postDelayed(this, 180);
+                if (lastWriteNoResponse) {
+                    handler.postDelayed(writer, 180);
+                } else {
+                    waitingWrite = true;
+                    handler.postDelayed(
+                        writeTimeout,
+                        3000
+                    );
+                }
 
             } catch (Exception e) {
                 setStatus("전송 실패");
-                finishCommand();
+                finishCurrent(false);
             }
+        }
+    };
+
+    private final BluetoothGattCallback callback =
+        new BluetoothGattCallback() {
+
+        @Override
+        public void onConnectionStateChange(
+            BluetoothGatt current,
+            int status,
+            int newState
+        ) {
+            handler.post(() -> {
+
+                if (finished || current != gatt) {
+                    return;
+                }
+
+                if (status == BluetoothGatt.GATT_SUCCESS &&
+                    newState ==
+                    BluetoothProfile.STATE_CONNECTED) {
+
+                    try {
+                        if (!current.discoverServices()) {
+                            setStatus("서비스 검색 실패");
+                            finishCurrent(false);
+                        }
+                    } catch (Exception e) {
+                        setStatus("서비스 검색 실패");
+                        finishCurrent(false);
+                    }
+
+                } else {
+                    setStatus("연결 실패");
+                    finishCurrent(false);
+                }
+            });
+        }
+
+        @Override
+        public void onServicesDiscovered(
+            BluetoothGatt current,
+            int status
+        ) {
+            handler.post(() -> {
+
+                if (finished || current != gatt) {
+                    return;
+                }
+
+                BluetoothGattService service =
+                    status == BluetoothGatt.GATT_SUCCESS
+                    ? current.getService(SERVICE_UUID)
+                    : null;
+
+                writeChar = service == null
+                    ? null
+                    : service.getCharacteristic(CHAR_UUID);
+
+                if (writeChar == null) {
+                    setStatus("기기 미지원");
+                    finishCurrent(false);
+                    return;
+                }
+
+                int properties = writeChar.getProperties();
+
+                if ((properties &
+                    (BluetoothGattCharacteristic.PROPERTY_WRITE |
+                     BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE))
+                    == 0) {
+
+                    setStatus("쓰기 미지원");
+                    finishCurrent(false);
+                    return;
+                }
+
+                handler.removeCallbacks(timeout);
+
+                setStatus("전송 중");
+                handler.post(writer);
+            });
+        }
+
+        @Override
+        public void onCharacteristicWrite(
+            BluetoothGatt current,
+            BluetoothGattCharacteristic characteristic,
+            int status
+        ) {
+            handler.post(() -> {
+
+                if (finished || current != gatt ||
+                    !waitingWrite) {
+                    return;
+                }
+
+                waitingWrite = false;
+                handler.removeCallbacks(writeTimeout);
+
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    setStatus("전송 실패");
+                    finishCurrent(false);
+                    return;
+                }
+
+                handler.postDelayed(writer, 110);
+            });
         }
     };
 
@@ -135,463 +282,434 @@ public class WidgetBleService extends Service {
 
     @Override
     public int onStartCommand(
-            Intent intent,
-            int flags,
-            int startId
+        Intent intent,
+        int flags,
+        int startId
     ) {
-        this.startId = startId;
+        latestStartId = startId;
 
         startForeground(
-                41,
-                createNotification()
+            NOTIFICATION_ID,
+            createNotification()
         );
 
         if (intent == null) {
-            finishCommand();
+            if (!busy && commands.isEmpty()) {
+                stopServiceNow();
+            }
             return START_NOT_STICKY;
         }
 
-        if (busy) {
-            return START_NOT_STICKY;
+        Intent copy = new Intent(intent);
+
+        // 중복 입력이 많을 때 마지막 명령 우선
+        if (commands.size() >= 5) {
+            commands.poll();
         }
 
-        finished = false;
-        busy = true;
+        commands.offer(copy);
 
-        String command =
-                intent.getStringExtra("command");
-
-        int index =
-                intent.getIntExtra("index", -1);
-
-        if (!hasPermission()) {
-            setStatus("권한 필요");
-            finishCommand();
-            return START_NOT_STICKY;
-        }
-
-        SharedPreferences app =
-                getSharedPreferences(
-                        AmbientWidget.PREFS,
-                        MODE_PRIVATE
-                );
-
-        String address =
-                app.getString("last_device", "");
-
-        if (address == null || address.isEmpty()) {
-            setStatus("기기 미등록");
-            finishCommand();
-            return START_NOT_STICKY;
-        }
-
-        if (!preparePackets(command, index)) {
-            finishCommand();
-            return START_NOT_STICKY;
-        }
-
-        BluetoothManager manager =
-                (BluetoothManager)
-                        getSystemService(BLUETOOTH_SERVICE);
-
-        BluetoothAdapter adapter =
-                manager == null
-                        ? null
-                        : manager.getAdapter();
-
-        if (adapter == null || !adapter.isEnabled()) {
-            setStatus("BT 꺼짐");
-            finishCommand();
-            return START_NOT_STICKY;
-        }
-
-        try {
-            BluetoothDevice device =
-                    adapter.getRemoteDevice(address);
-
-            setStatus("연결 중");
-
-            gatt = device.connectGatt(
-                    this,
-                    false,
-                    callback,
-                    BluetoothDevice.TRANSPORT_LE
-            );
-
-            handler.postDelayed(timeout, 12000);
-
-        } catch (Exception e) {
-            setStatus("연결 실패");
-            finishCommand();
+        if (!busy) {
+            startNextCommand();
         }
 
         return START_NOT_STICKY;
     }
 
-    private boolean preparePackets(
-            String command,
-            int index
-    ) {
-        if (command == null) {
-            return false;
+    private void startNextCommand() {
+
+        if (busy) {
+            return;
         }
 
-        queue.clear();
+        Intent intent = commands.poll();
 
-        SharedPreferences app =
-                getSharedPreferences(
-                        AmbientWidget.PREFS,
-                        MODE_PRIVATE
-                );
+        if (intent == null) {
+            stopServiceNow();
+            return;
+        }
 
-        SharedPreferences widget =
-                getSharedPreferences(
-                        AmbientWidget.WIDGET_PREFS,
-                        MODE_PRIVATE
-                );
+        busy = true;
+        finished = false;
+        waitingWrite = false;
+
+        pendingCommand =
+            intent.getStringExtra("command");
+
+        pendingIndex =
+            intent.getIntExtra("index", -1);
+
+        if (!hasPermission()) {
+            setStatus("블루투스 권한 필요");
+            finishCurrent(false);
+            return;
+        }
+
+        SharedPreferences app = appPrefs();
+
+        String address =
+            app.getString("last_device", "");
+
+        if (address == null || address.isEmpty()) {
+            setStatus("기기 미등록");
+            finishCurrent(false);
+            return;
+        }
+
+        if (!preparePackets(
+            pendingCommand,
+            pendingIndex
+        )) {
+            setStatus("명령 확인 필요");
+            finishCurrent(false);
+            return;
+        }
+
+        BluetoothManager manager =
+            (BluetoothManager)
+            getSystemService(BLUETOOTH_SERVICE);
+
+        BluetoothAdapter adapter =
+            manager == null
+            ? null
+            : manager.getAdapter();
+
+        if (adapter == null || !adapter.isEnabled()) {
+            setStatus("블루투스 꺼짐");
+            finishCurrent(false);
+            return;
+        }
+
+        try {
+            BluetoothDevice device =
+                adapter.getRemoteDevice(address);
+
+            setStatus("연결 중");
+
+            gatt = device.connectGatt(
+                this,
+                false,
+                callback,
+                BluetoothDevice.TRANSPORT_LE
+            );
+
+            if (gatt == null) {
+                setStatus("연결 시작 실패");
+                finishCurrent(false);
+                return;
+            }
+
+            handler.postDelayed(timeout, 12000);
+
+        } catch (Exception e) {
+            setStatus("연결 실패");
+            finishCurrent(false);
+        }
+    }
+
+    private boolean preparePackets(
+        String command,
+        int index
+    ) {
+        packets.clear();
+
+        SharedPreferences app = appPrefs();
 
         if ("preset".equals(command)) {
 
-            if (index < 0 || index >= 6) {
+            if (index < 0 || index >= 6 ||
+                !app.contains("preset_" + index)) {
                 return false;
             }
 
-            int[] defaults = {
-                    0xFFFF3434,
-                    0xFFFF9B28,
-                    0xFFFFE144,
-                    0xFF36D66A,
-                    0xFF308BFF,
-                    0xFFAE51E9
-            };
-
             int color = app.getInt(
-                    "preset_" + index,
-                    defaults[index]
+                "preset_" + index,
+                0xFFFFFFFF
             );
 
-            queue.add(hex(
-                    "7BFF0407FFFFFFFFBF"
+            packets.offer(ON);
+
+            packets.offer(rgb(
+                (color >> 16) & 255,
+                (color >> 8) & 255,
+                color & 255
             ));
-
-            queue.add(rgb(
-                    ColorRed(color),
-                    ColorGreen(color),
-                    ColorBlue(color)
-            ));
-
-            widget.edit()
-                    .putInt("selected_preset", index)
-                    .putBoolean("power_on", true)
-                    .apply();
-
-            app.edit()
-                    .putInt("color_r", ColorRed(color))
-                    .putInt("color_g", ColorGreen(color))
-                    .putInt("color_b", ColorBlue(color))
-                    .putBoolean("mode_running", false)
-                    .apply();
 
         } else if ("sequential".equals(command)) {
 
-            queue.add(hex(
-                    "7BFF0407FFFFFFFFBF"
+            packets.offer(ON);
+            packets.offer(SEQUENTIAL);
+            packets.offer(speed(
+                app.getInt("mode_speed", 50)
             ));
-
-            queue.add(hex(
-                    "7BFF0351FFFFFFFFBF"
-            ));
-
-            queue.add(speed(
-                    app.getInt("mode_speed", 50)
-            ));
-
-            widget.edit()
-                    .putInt("selected_preset", -1)
-                    .putBoolean("power_on", true)
-                    .apply();
-
-            app.edit()
-                    .putBoolean("mode_running", true)
-                    .apply();
 
         } else if ("rainbow".equals(command)) {
 
-            queue.add(hex(
-                    "7BFF0407FFFFFFFFBF"
+            packets.offer(ON);
+            packets.offer(RAINBOW);
+            packets.offer(speed(
+                app.getInt("mode_speed", 50)
             ));
-
-            queue.add(hex(
-                    "7BFF0301FFFFFFFFBF"
-            ));
-
-            queue.add(speed(
-                    app.getInt("mode_speed", 50)
-            ));
-
-            widget.edit()
-                    .putInt("selected_preset", -1)
-                    .putBoolean("power_on", true)
-                    .apply();
-
-            app.edit()
-                    .putBoolean("mode_running", true)
-                    .apply();
 
         } else if ("power".equals(command)) {
 
-            boolean power =
-                    widget.getBoolean("power_on", true);
+            boolean currentlyOn =
+                widgetPrefs().getBoolean(
+                    "power_on",
+                    true
+                );
 
-            boolean newPower = !power;
-
-            queue.add(hex(
-                    newPower
-                            ? "7BFF0407FFFFFFFFBF"
-                            : "7BFF0406FFFFFFFFBF"
-            ));
-
-            widget.edit()
-                    .putBoolean("power_on", newPower)
-                    .apply();
-
-            if (!newPower) {
-                app.edit()
-                        .putBoolean("mode_running", false)
-                        .apply();
-            }
+            packets.offer(
+                currentlyOn ? OFF : ON
+            );
 
         } else {
             return false;
         }
 
-        AmbientWidget.updateAll(this);
         return true;
     }
 
-    private final BluetoothGattCallback callback =
-            new BluetoothGattCallback() {
+    private void commitState() {
 
-                @Override
-                public void onConnectionStateChange(
-                        BluetoothGatt current,
-                        int status,
-                        int newState
-                ) {
-                    handler.post(() -> {
+        SharedPreferences app = appPrefs();
 
-                        if (finished || current != gatt) {
-                            return;
-                        }
+        SharedPreferences widget = widgetPrefs();
 
-                        if (status == BluetoothGatt.GATT_SUCCESS &&
-                                newState ==
-                                        BluetoothProfile.STATE_CONNECTED) {
+        if ("preset".equals(pendingCommand)) {
 
-                            try {
-                                if (!current.discoverServices()) {
-                                    setStatus("서비스 오류");
-                                    finishCommand();
-                                }
-                            } catch (Exception e) {
-                                setStatus("서비스 오류");
-                                finishCommand();
-                            }
+            int color = app.getInt(
+                "preset_" + pendingIndex,
+                ColorWhite()
+            );
 
-                        } else {
-                            setStatus("연결 실패");
-                            finishCommand();
-                        }
-                    });
-                }
+            app.edit()
+                .putInt("color_r", (color >> 16) & 255)
+                .putInt("color_g", (color >> 8) & 255)
+                .putInt("color_b", color & 255)
+                .putBoolean("mode_running", false)
+                .apply();
 
-                @Override
-                public void onServicesDiscovered(
-                        BluetoothGatt current,
-                        int status
-                ) {
-                    handler.post(() -> {
+            widget.edit()
+                .putInt("selected_preset", pendingIndex)
+                .putBoolean("power_on", true)
+                .apply();
 
-                        if (finished || current != gatt) {
-                            return;
-                        }
+        } else if ("sequential".equals(pendingCommand)) {
 
-                        BluetoothGattService service =
-                                status == BluetoothGatt.GATT_SUCCESS
-                                        ? current.getService(SERVICE_UUID)
-                                        : null;
+            app.edit()
+                .putInt("selected_mode", 0)
+                .putBoolean("mode_running", true)
+                .apply();
 
-                        characteristic =
-                                service == null
-                                        ? null
-                                        : service.getCharacteristic(
-                                                CHAR_UUID
-                                        );
+            widget.edit()
+                .putInt("selected_preset", -1)
+                .putBoolean("power_on", true)
+                .apply();
 
-                        if (characteristic == null) {
-                            setStatus("기기 미지원");
-                            finishCommand();
-                            return;
-                        }
+        } else if ("rainbow".equals(pendingCommand)) {
 
-                        handler.removeCallbacks(timeout);
+            app.edit()
+                .putInt("selected_mode", 1)
+                .putBoolean("mode_running", true)
+                .apply();
 
-                        setStatus("연결됨");
+            widget.edit()
+                .putInt("selected_preset", -1)
+                .putBoolean("power_on", true)
+                .apply();
 
-                        handler.post(writer);
-                    });
-                }
-            };
+        } else if ("power".equals(pendingCommand)) {
+
+            boolean oldPower =
+                widget.getBoolean("power_on", true);
+
+            boolean newPower = !oldPower;
+
+            widget.edit()
+                .putBoolean("power_on", newPower)
+                .apply();
+
+            if (!newPower) {
+                app.edit()
+                    .putBoolean("mode_running", false)
+                    .apply();
+            }
+        }
+
+        AmbientWidget.updateAll(this);
+    }
+
+    private static int ColorWhite() {
+        return 0xFFFFFFFF;
+    }
+
+    private void finishCurrent(boolean success) {
+
+        if (finished) {
+            return;
+        }
+
+        finished = true;
+
+        handler.removeCallbacks(timeout);
+        handler.removeCallbacks(writer);
+        handler.removeCallbacks(writeTimeout);
+
+        if (success) {
+            commitState();
+        }
+
+        BluetoothGatt old = gatt;
+
+        gatt = null;
+        writeChar = null;
+        packets.clear();
+        waitingWrite = false;
+
+        if (old != null) {
+            try {
+                old.disconnect();
+                old.close();
+            } catch (Exception ignored) {}
+        }
+
+        busy = false;
+
+        if (!commands.isEmpty()) {
+            handler.postDelayed(
+                this::startNextCommand,
+                300
+            );
+        } else {
+            stopServiceNow();
+        }
+    }
+
+    private void stopServiceNow() {
+        stopForeground(STOP_FOREGROUND_REMOVE);
+        stopSelfResult(latestStartId);
+    }
+
+    private SharedPreferences appPrefs() {
+        return getSharedPreferences(
+            AmbientWidget.PREFS,
+            MODE_PRIVATE
+        );
+    }
+
+    private SharedPreferences widgetPrefs() {
+        return getSharedPreferences(
+            AmbientWidget.WIDGET_PREFS,
+            MODE_PRIVATE
+        );
+    }
 
     private boolean hasPermission() {
         if (Build.VERSION.SDK_INT >= 31) {
             return checkSelfPermission(
-                    Manifest.permission.BLUETOOTH_CONNECT
+                Manifest.permission.BLUETOOTH_CONNECT
             ) == PackageManager.PERMISSION_GRANTED;
         }
 
         return true;
     }
 
-    private void setStatus(String status) {
-        getSharedPreferences(
-                AmbientWidget.WIDGET_PREFS,
-                MODE_PRIVATE
-        ).edit()
-                .putString("connection_status", status)
-                .apply();
+    private void setStatus(String value) {
+        widgetPrefs().edit()
+            .putString("connection_status", value)
+            .apply();
 
         AmbientWidget.updateAll(this);
     }
 
-    private void finishCommand() {
-        if (finished) {
-            return;
-        }
-
-        finished = true;
-        busy = false;
-
-        handler.removeCallbacks(timeout);
-        handler.removeCallbacks(writer);
-
-        BluetoothGatt old = gatt;
-
-        gatt = null;
-        characteristic = null;
-        queue.clear();
-
-        if (old != null) {
-            try {
-                old.disconnect();
-                old.close();
-            } catch (Exception ignored) {
-            }
-        }
-
-        stopForeground(STOP_FOREGROUND_REMOVE);
-        stopSelfResult(startId);
-    }
-
     private void createNotificationChannel() {
+
         if (Build.VERSION.SDK_INT >= 26) {
 
             NotificationChannel channel =
-                    new NotificationChannel(
-                            CHANNEL_ID,
-                            "엠비언트 위젯 연결",
-                            NotificationManager.IMPORTANCE_LOW
-                    );
+                new NotificationChannel(
+                    CHANNEL_ID,
+                    "엠비언트 위젯 연결",
+                    NotificationManager.IMPORTANCE_LOW
+                );
 
             NotificationManager manager =
-                    getSystemService(
-                            NotificationManager.class
-                    );
+                getSystemService(
+                    NotificationManager.class
+                );
 
-            manager.createNotificationChannel(channel);
+            if (manager != null) {
+                manager.createNotificationChannel(
+                    channel
+                );
+            }
         }
     }
 
     private Notification createNotification() {
 
         Notification.Builder builder =
-                Build.VERSION.SDK_INT >= 26
-                        ? new Notification.Builder(
-                                this,
-                                CHANNEL_ID
-                        )
-                        : new Notification.Builder(this);
+            Build.VERSION.SDK_INT >= 26
+            ? new Notification.Builder(
+                this,
+                CHANNEL_ID
+            )
+            : new Notification.Builder(this);
 
         return builder
-                .setContentTitle("엠비언트 설정")
-                .setContentText("차량 조명 명령 전송 중")
-                .setSmallIcon(
-                        android.R.drawable.stat_sys_data_bluetooth
-                )
-                .setOngoing(true)
-                .build();
-    }
-
-    private static int ColorRed(int color) {
-        return (color >> 16) & 255;
-    }
-
-    private static int ColorGreen(int color) {
-        return (color >> 8) & 255;
-    }
-
-    private static int ColorBlue(int color) {
-        return color & 255;
+            .setContentTitle("엠비언트 설정")
+            .setContentText("차량 조명 명령 전송 중")
+            .setSmallIcon(
+                android.R.drawable.stat_sys_data_bluetooth
+            )
+            .setOngoing(true)
+            .build();
     }
 
     private static byte[] rgb(
-            int r,
-            int g,
-            int b
+        int r, int g, int b
     ) {
         return new byte[]{
-                0x7B,
-                0x01,
-                0x07,
-                (byte) r,
-                (byte) g,
-                (byte) b,
-                0x00,
-                (byte) 0xFF,
-                (byte) 0xBF
+            0x7B, 0x01, 0x07,
+            (byte) r,
+            (byte) g,
+            (byte) b,
+            0x00,
+            (byte) 0xFF,
+            (byte) 0xBF
         };
     }
 
     private static byte[] speed(int value) {
+
         value = Math.max(
-                1,
-                Math.min(100, value)
+            1,
+            Math.min(100, value)
         );
 
         return new byte[]{
-                0x7B,
-                (byte) 0xFF,
-                0x02,
-                (byte) value,
-                (byte) 0xFF,
-                0x00,
-                (byte) 0xFF,
-                (byte) 0xFF,
-                (byte) 0xBF
+            0x7B,
+            (byte) 0xFF,
+            0x02,
+            (byte) value,
+            (byte) 0xFF,
+            0x00,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xBF
         };
     }
 
     private static byte[] hex(String value) {
+
         byte[] bytes =
-                new byte[value.length() / 2];
+            new byte[value.length() / 2];
 
         for (int i = 0; i < bytes.length; i++) {
             bytes[i] = (byte) Integer.parseInt(
-                    value.substring(
-                            i * 2,
-                            i * 2 + 2
-                    ),
-                    16
+                value.substring(i * 2, i * 2 + 2),
+                16
             );
         }
 
@@ -612,8 +730,7 @@ public class WidgetBleService extends Service {
             try {
                 gatt.disconnect();
                 gatt.close();
-            } catch (Exception ignored) {
-            }
+            } catch (Exception ignored) {}
 
             gatt = null;
         }
@@ -621,4 +738,3 @@ public class WidgetBleService extends Service {
         super.onDestroy();
     }
 }
-
