@@ -20,54 +20,12 @@ jobs:
       - name: Inspect repository structure
         shell: bash
         run: |
-          echo "================================"
-          echo "Repository structure"
-          echo "================================"
-
+          echo "=== Repository files ==="
           pwd
           ls -la
 
-          echo "================================"
-          echo "Android project files"
-          echo "================================"
-
-          find . -maxdepth 5 -type f \
-            | sort \
-            | head -n 150
-
-          echo "================================"
-          echo "Checking required files"
-          echo "================================"
-
-          if [ -f settings.gradle ]; then
-            echo "OK: settings.gradle"
-          elif [ -f settings.gradle.kts ]; then
-            echo "OK: settings.gradle.kts"
-          else
-            echo "MISSING: settings.gradle"
-          fi
-
-          if [ -f app/build.gradle ]; then
-            echo "OK: app/build.gradle"
-          elif [ -f app/build.gradle.kts ]; then
-            echo "OK: app/build.gradle.kts"
-          else
-            echo "MISSING: app/build.gradle"
-          fi
-
-          if [ -f app/src/main/AndroidManifest.xml ]; then
-            echo "OK: app/src/main/AndroidManifest.xml"
-          else
-            echo "MISSING: app/src/main/AndroidManifest.xml"
-          fi
-
-          if [ -f AndroidManifest.xml ]; then
-            echo "FOUND: Root AndroidManifest.xml"
-          fi
-
-          if [ -f MainActivity.java ]; then
-            echo "FOUND: Root MainActivity.java"
-          fi
+          echo "=== Android project files ==="
+          find . -maxdepth 5 -type f | sort | head -n 150
 
       - name: Restore Android project structure
         shell: bash
@@ -79,19 +37,17 @@ jobs:
 
           if [ -f AndroidManifest.xml ]; then
             if [ ! -f app/src/main/AndroidManifest.xml ]; then
-              cp AndroidManifest.xml \
-                app/src/main/AndroidManifest.xml
-              echo "Restored root AndroidManifest.xml"
+              cp AndroidManifest.xml app/src/main/AndroidManifest.xml
+              echo "Restored AndroidManifest.xml"
             else
-              echo "Using existing app AndroidManifest.xml"
+              echo "Using existing AndroidManifest.xml"
             fi
           fi
 
           if [ -f MainActivity.java ]; then
             if [ ! -f app/src/main/java/com/ledcar/ambient/MainActivity.java ]; then
-              cp MainActivity.java \
-                app/src/main/java/com/ledcar/ambient/MainActivity.java
-              echo "Restored root MainActivity.java"
+              cp MainActivity.java app/src/main/java/com/ledcar/ambient/MainActivity.java
+              echo "Restored MainActivity.java"
             else
               echo "Using existing MainActivity.java"
             fi
@@ -132,16 +88,17 @@ jobs:
       - name: Validate project files
         shell: bash
         run: |
-          echo "================================"
-          echo "Final project validation"
-          echo "================================"
+          echo "=== Gradle settings ==="
 
-          if [ -f settings.gradle ] || \
-             [ -f settings.gradle.kts ]; then
-            echo "OK: Gradle settings"
+          if [ -f settings.gradle ]; then
+            echo "OK: settings.gradle"
+          elif [ -f settings.gradle.kts ]; then
+            echo "OK: settings.gradle.kts"
           else
             echo "WARNING: Gradle settings missing"
           fi
+
+          echo "=== App Gradle configuration ==="
 
           if [ -f app/build.gradle ] || \
              [ -f app/build.gradle.kts ]; then
@@ -151,6 +108,8 @@ jobs:
             exit 1
           fi
 
+          echo "=== AndroidManifest.xml ==="
+
           if [ -f app/src/main/AndroidManifest.xml ]; then
             echo "OK: AndroidManifest.xml"
           else
@@ -158,24 +117,66 @@ jobs:
             exit 1
           fi
 
-          echo "================================"
-          echo "Manifest content"
-          echo "================================"
-
-          cat -n app/src/main/AndroidManifest.xml
-
-          echo "================================"
-          echo "Manifest file encoding"
-          echo "================================"
-
+          echo "=== Manifest file information ==="
           file app/src/main/AndroidManifest.xml
 
-          echo "================================"
-          echo "Manifest first bytes"
-          echo "================================"
+          echo "=== Manifest first bytes ==="
+          od -An -tx1 -N32 app/src/main/AndroidManifest.xml
 
-          od -An -tx1 -N32 \
-            app/src/main/AndroidManifest.xml
+      - name: Check Manifest XML syntax
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          path = Path("app/src/main/AndroidManifest.xml")
+
+          print("================================")
+          print("AndroidManifest.xml syntax check")
+          print("================================")
+
+          data = path.read_bytes()
+
+          print("File size:", len(data), "bytes")
+          print("First 32 bytes:", data[:32].hex(" "))
+
+          try:
+              ET.parse(path)
+              print("RESULT: XML SYNTAX OK")
+
+          except ET.ParseError as error:
+              print("RESULT: XML SYNTAX FAILED")
+              print("ERROR:", error)
+
+              line_number, column = error.position
+
+              print("LINE:", line_number)
+              print("COLUMN:", column)
+
+              lines = data.decode(
+                  "utf-8",
+                  errors="replace"
+              ).splitlines()
+
+              start = max(0, line_number - 4)
+              end = min(len(lines), line_number + 3)
+
+              print("=== Error context ===")
+
+              for i in range(start, end):
+                  marker = ">>" if i + 1 == line_number else "  "
+                  print(
+                      f"{marker} {i + 1}: {lines[i]}"
+                  )
+
+              raise SystemExit(1)
+
+          except Exception as error:
+              print("RESULT: XML CHECK FAILED")
+              print("ERROR:", repr(error))
+              raise SystemExit(1)
+          PY
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -186,11 +187,8 @@ jobs:
       - name: Configure Android SDK
         shell: bash
         run: |
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" \
-            >> "$GITHUB_PATH"
-
-          echo "$ANDROID_HOME/platform-tools" \
-            >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
       - name: Install Android SDK 35
         shell: bash
