@@ -1,4 +1,3 @@
-
 name: Build LEDCAR APK
 
 on:
@@ -17,15 +16,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Inspect repository structure
+      - name: Inspect repository
         shell: bash
         run: |
           echo "=== Repository files ==="
-          pwd
           ls -la
 
           echo "=== Android project files ==="
-          find . -maxdepth 5 -type f | sort | head -n 150
+          find . -maxdepth 5 -type f | sort | head -n 100
 
       - name: Restore Android project structure
         shell: bash
@@ -35,28 +33,19 @@ jobs:
           mkdir -p app/src/main
           mkdir -p app/src/main/java/com/ledcar/ambient
 
-          if [ -f AndroidManifest.xml ]; then
-            if [ ! -f app/src/main/AndroidManifest.xml ]; then
-              cp AndroidManifest.xml app/src/main/AndroidManifest.xml
-              echo "Restored AndroidManifest.xml"
-            else
-              echo "Using existing AndroidManifest.xml"
-            fi
+          if [ -f AndroidManifest.xml ] && \
+             [ ! -f app/src/main/AndroidManifest.xml ]; then
+            cp AndroidManifest.xml app/src/main/AndroidManifest.xml
           fi
 
-          if [ -f MainActivity.java ]; then
-            if [ ! -f app/src/main/java/com/ledcar/ambient/MainActivity.java ]; then
-              cp MainActivity.java app/src/main/java/com/ledcar/ambient/MainActivity.java
-              echo "Restored MainActivity.java"
-            else
-              echo "Using existing MainActivity.java"
-            fi
+          if [ -f MainActivity.java ] && \
+             [ ! -f app/src/main/java/com/ledcar/ambient/MainActivity.java ]; then
+            cp MainActivity.java \
+              app/src/main/java/com/ledcar/ambient/MainActivity.java
           fi
 
           if [ ! -f app/build.gradle ] && \
              [ ! -f app/build.gradle.kts ]; then
-
-            echo "Creating app/build.gradle"
 
             cat > app/build.gradle <<'EOF'
           plugins {
@@ -83,45 +72,50 @@ jobs:
           EOF
           fi
 
-          echo "Project restoration finished."
+          echo "Project structure ready."
 
       - name: Validate project files
         shell: bash
         run: |
-          echo "=== Gradle settings ==="
+          echo "=== Checking project files ==="
 
-          if [ -f settings.gradle ]; then
-            echo "OK: settings.gradle"
-          elif [ -f settings.gradle.kts ]; then
-            echo "OK: settings.gradle.kts"
-          else
-            echo "WARNING: Gradle settings missing"
-          fi
-
-          echo "=== App Gradle configuration ==="
-
-          if [ -f app/build.gradle ] || \
-             [ -f app/build.gradle.kts ]; then
-            echo "OK: App Gradle configuration"
-          else
-            echo "ERROR: App Gradle configuration missing"
+          if [ ! -f settings.gradle ] && \
+             [ ! -f settings.gradle.kts ]; then
+            echo "ERROR: settings.gradle missing"
             exit 1
           fi
 
-          echo "=== AndroidManifest.xml ==="
+          if [ ! -f app/build.gradle ] && \
+             [ ! -f app/build.gradle.kts ]; then
+            echo "ERROR: app/build.gradle missing"
+            exit 1
+          fi
 
-          if [ -f app/src/main/AndroidManifest.xml ]; then
-            echo "OK: AndroidManifest.xml"
-          else
+          if [ ! -f app/src/main/AndroidManifest.xml ]; then
             echo "ERROR: AndroidManifest.xml missing"
             exit 1
           fi
 
-          echo "=== Manifest file information ==="
-          file app/src/main/AndroidManifest.xml
+          echo "All required project files found."
 
-          echo "=== Manifest first bytes ==="
-          od -An -tx1 -N32 app/src/main/AndroidManifest.xml
+      - name: Fix Manifest leading whitespace
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("app/src/main/AndroidManifest.xml")
+          data = path.read_bytes()
+
+          if data.startswith(b"\xef\xbb\xbf"):
+              data = data[3:]
+
+          data = data.lstrip(b" \t\r\n")
+
+          path.write_bytes(data)
+
+          print("Manifest first bytes:", data[:16].hex(" "))
+          PY
 
       - name: Check Manifest XML syntax
         shell: bash
@@ -132,15 +126,6 @@ jobs:
 
           path = Path("app/src/main/AndroidManifest.xml")
 
-          print("================================")
-          print("AndroidManifest.xml syntax check")
-          print("================================")
-
-          data = path.read_bytes()
-
-          print("File size:", len(data), "bytes")
-          print("First 32 bytes:", data[:32].hex(" "))
-
           try:
               ET.parse(path)
               print("RESULT: XML SYNTAX OK")
@@ -149,32 +134,21 @@ jobs:
               print("RESULT: XML SYNTAX FAILED")
               print("ERROR:", error)
 
-              line_number, column = error.position
-
-              print("LINE:", line_number)
+              line, column = error.position
+              print("LINE:", line)
               print("COLUMN:", column)
 
-              lines = data.decode(
-                  "utf-8",
+              lines = path.read_text(
+                  encoding="utf-8",
                   errors="replace"
               ).splitlines()
 
-              start = max(0, line_number - 4)
-              end = min(len(lines), line_number + 3)
-
-              print("=== Error context ===")
+              start = max(0, line - 4)
+              end = min(len(lines), line + 3)
 
               for i in range(start, end):
-                  marker = ">>" if i + 1 == line_number else "  "
-                  print(
-                      f"{marker} {i + 1}: {lines[i]}"
-                  )
+                  print(f"{i + 1}: {lines[i]}")
 
-              raise SystemExit(1)
-
-          except Exception as error:
-              print("RESULT: XML CHECK FAILED")
-              print("ERROR:", repr(error))
               raise SystemExit(1)
           PY
 
@@ -212,10 +186,49 @@ jobs:
       - name: Build APK
         shell: bash
         run: |
+          set +e
+
           gradle --no-daemon \
             :app:assembleDebug \
-            --stacktrace \
-            --info
+            --console=plain \
+            > build.log 2>&1
+
+          RESULT=$?
+
+          echo "================================"
+          echo "BUILD ERROR SUMMARY"
+          echo "================================"
+
+          grep -n -i -E \
+            'FAILED|error:|what went wrong|execution failed|caused by|exception|cannot find symbol|symbol:|location:' \
+            build.log | tail -n 80 || true
+
+          echo "================================"
+          echo "LAST 80 LOG LINES"
+          echo "================================"
+
+          tail -n 80 build.log
+
+          echo "================================"
+          echo "BUILD RESULT"
+          echo "================================"
+
+          if [ "$RESULT" -eq 0 ]; then
+            echo "BUILD SUCCESSFUL"
+          else
+            echo "BUILD FAILED"
+            echo "Exit code: $RESULT"
+          fi
+
+          exit "$RESULT"
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LEDCAR-Build-Error-Log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload APK
         if: success()
