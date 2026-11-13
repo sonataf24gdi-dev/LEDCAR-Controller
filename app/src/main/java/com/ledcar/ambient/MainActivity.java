@@ -32,6 +32,11 @@ public class MainActivity extends Activity {
     private static final int ENGINE_PHONE = 1;
     private static final int ENGINE_RAINBOW = 2;
 
+    // CAR02 실험용 설정
+    private static final int CAR02_ALL = 0;
+    private static final int CAR02_LED1 = 1;
+    private static final int CAR02_LED2 = 2;
+
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private BluetoothAdapter adapter;
@@ -79,6 +84,19 @@ public class MainActivity extends Activity {
     private boolean sending;
     private final StringBuilder logBuffer = new StringBuilder();
 
+    // CAR02 테스트 상태
+    private int car02Target = CAR02_ALL;
+    private int car02Red = 255;
+    private int car02Green = 0;
+    private int car02Blue = 0;
+    private int car02Selector = 0;
+    private int car02Format = 0;
+
+    private TextView car02Preview;
+    private TextView car02TargetLabel;
+    private TextView car02RgbLabel;
+    private EditText car02SelectorInput;
+
     private SharedPreferences prefs() {
         return getSharedPreferences("MainActivity", MODE_PRIVATE);
     }
@@ -91,7 +109,6 @@ public class MainActivity extends Activity {
         return phoneServiceActive || phoneStopPending;
     }
 
-    // 선택한 조명 효과를 기존 저장 형식과 호환되도록 관리한다.
     private int selectedEffect() {
         if (selectedMode == 1 ||
             sequentialEngine == ENGINE_RAINBOW) {
@@ -109,7 +126,6 @@ public class MainActivity extends Activity {
 
         if (effect == selectedEffect()) return;
 
-        // 기존 컨트롤러 효과 실행 중이면 새 효과로 전환한다.
         boolean wasRunning = modeRunning;
         if (wasRunning) {
             stopModeLocal();
@@ -706,7 +722,6 @@ public class MainActivity extends Activity {
         contentContainer.setOrientation(LinearLayout.VERTICAL);
         mainRoot.addView(contentContainer);
 
-        // 이전 탭의 View 참조를 초기화한다.
         wheel = null;
         colorLabel = null;
         redBar = null;
@@ -725,8 +740,6 @@ public class MainActivity extends Activity {
         updateStatusViews();
     }
 
-    // 색상 탭: 색상표 + 프리셋만 유지한다.
-    // RGB 개별 조절바는 개발자 모드로 이동했다.
     private void buildColorPage() {
         section(contentContainer, "색상표");
 
@@ -756,7 +769,6 @@ public class MainActivity extends Activity {
         wheel.setSelectedColor(Color.rgb(r, g, b));
     }
 
-    // 모드 탭: 정확히 세 가지 효과를 표시한다.
     private void buildModePage() {
         section(contentContainer, "조명 효과");
 
@@ -964,7 +976,6 @@ public class MainActivity extends Activity {
         updateModeUI();
     }
 
-    // 기존 정상 작동 중인 백그라운드 서비스 호출 유지.
     private void startPhoneService() {
         if (phoneBusy()) return;
 
@@ -1369,7 +1380,6 @@ public class MainActivity extends Activity {
             .show();
     }
 
-    // 개발자 모드: RGB 개별 조절을 이곳으로 이동했다.
     private void buildDeveloperPage() {
         developerPage = column();
 
@@ -1525,6 +1535,9 @@ public class MainActivity extends Activity {
         button(developerPage, "현재 RGB 고정",
             () -> sendTest(rgbPacket(r, g, b)));
 
+        // CAR02 투톤 테스트 영역
+        buildCar02TestSection(developerPage);
+
         section(developerPage, "BLE 전송 로그");
 
         developerLog = text(
@@ -1538,6 +1551,293 @@ public class MainActivity extends Activity {
             logBuffer.setLength(0);
             developerLog.setText("전송 기록 없음");
         });
+    }
+
+    // ============================================================
+    // CAR02 투톤 실험
+    // ============================================================
+
+    private byte[] buildCar02CandidatePacket() {
+
+        int selector = car02Selector & 0xFF;
+
+        if (car02Format == 0) {
+            return new byte[] {
+                0x7B,
+                0x07,
+                (byte) car02Red,
+                (byte) car02Green,
+                (byte) car02Blue,
+                0x00,
+                (byte) 0xFF,
+                (byte) selector,
+                (byte) 0xBF
+            };
+        }
+
+        return new byte[] {
+            0x7B,
+            0x07,
+            (byte) car02Red,
+            (byte) car02Green,
+            (byte) car02Blue,
+            0x55,
+            0x07,
+            (byte) selector,
+            (byte) 0xBF
+        };
+    }
+
+    private void updateCar02Preview() {
+
+        if (car02TargetLabel != null) {
+            String targetName;
+
+            switch (car02Target) {
+                case CAR02_LED1:
+                    targetName = "LED1";
+                    break;
+                case CAR02_LED2:
+                    targetName = "LED2";
+                    break;
+                default:
+                    targetName = "ALL";
+                    break;
+            }
+
+            car02TargetLabel.setText(
+                "선택 구역: " + targetName);
+        }
+
+        if (car02RgbLabel != null) {
+            car02RgbLabel.setText(
+                String.format(
+                    Locale.US,
+                    "R %d · G %d · B %d",
+                    car02Red, car02Green, car02Blue));
+        }
+
+        if (car02Preview != null) {
+            car02Preview.setText(
+                "후보 HEX:\n" +
+                toHex(buildCar02CandidatePacket()) +
+                "\n\n구역 선택값: 0x" +
+                String.format(
+                    Locale.US,
+                    "%02X", car02Selector & 0xFF) +
+                "\n명령 형식: " +
+                (car02Format == 0 ? "A" : "B") +
+                "\n\n※ 미검증 명령입니다.");
+        }
+    }
+
+    private void setCar02Target(int target) {
+        car02Target = target;
+
+        switch (target) {
+            case CAR02_LED1:
+                car02Selector = 1;
+                break;
+            case CAR02_LED2:
+                car02Selector = 2;
+                break;
+            default:
+                car02Selector = 0;
+                break;
+        }
+
+        if (car02SelectorInput != null) {
+            car02SelectorInput.setText(
+                String.format(
+                    Locale.US,
+                    "%02X", car02Selector));
+        }
+
+        updateCar02Preview();
+    }
+
+    private void showCar02SendConfirmation() {
+
+        if (!canSendManualCommand()) return;
+
+        if (modeRunning) {
+            toast("실행 중인 조명 효과를 먼저 중지하세요");
+            return;
+        }
+
+        final byte[] packet = buildCar02CandidatePacket();
+        final String packetHex = toHex(packet);
+
+        new AlertDialog.Builder(this)
+            .setTitle("CAR02 실험 명령 전송")
+            .setMessage(
+                "이 명령은 현재 컨트롤러에서 검증되지 않았습니다." +
+                "\n\n전송 HEX:\n" + packetHex +
+                "\n\n예상하지 못한 점등이나 설정 변경이 " +
+                "발생할 수 있습니다.\n\n전송하시겠습니까?")
+            .setPositiveButton("전송", (dialog, which) -> {
+                if (!canSendManualCommand()) return;
+
+                if (modeRunning) {
+                    toast("조명 효과를 먼저 중지하세요");
+                    return;
+                }
+
+                log("CAR02 실험 TX 요청: " + packetHex);
+                send(packet);
+            })
+            .setNegativeButton("취소", null)
+            .show();
+    }
+
+    private void buildCar02TestSection(LinearLayout parent) {
+
+        section(parent, "CAR02 투톤 제어 실험");
+
+        parent.addView(text(
+            "제조사 APK의 CAR02 관련 명령을 검증하기 위한 " +
+            "실험 기능입니다.\n" +
+            "LED1·LED2 선택값과 현재 차량의 호환성은 " +
+            "아직 확인되지 않았습니다.",
+            13, muted()));
+
+        section(parent, "LED 구역 선택");
+
+        car02TargetLabel = text("선택 구역: ALL", 15, fg());
+        parent.addView(car02TargetLabel);
+
+        button(parent, "LED 전체 선택",
+            () -> setCar02Target(CAR02_ALL));
+
+        button(parent, "LED1 선택",
+            () -> setCar02Target(CAR02_LED1));
+
+        button(parent, "LED2 선택",
+            () -> setCar02Target(CAR02_LED2));
+
+        section(parent, "테스트 색상");
+
+        car02RgbLabel = text("", 15, fg());
+        parent.addView(car02RgbLabel);
+
+        button(parent, "빨간색", () -> {
+            car02Red = 255;
+            car02Green = 0;
+            car02Blue = 0;
+            updateCar02Preview();
+        });
+
+        button(parent, "초록색", () -> {
+            car02Red = 0;
+            car02Green = 255;
+            car02Blue = 0;
+            updateCar02Preview();
+        });
+
+        button(parent, "파란색", () -> {
+            car02Red = 0;
+            car02Green = 0;
+            car02Blue = 255;
+            updateCar02Preview();
+        });
+
+        button(parent, "흰색", () -> {
+            car02Red = 255;
+            car02Green = 255;
+            car02Blue = 255;
+            updateCar02Preview();
+        });
+
+        section(parent, "CAR02 명령 형식");
+
+        RadioGroup formatGroup = new RadioGroup(this);
+        formatGroup.setOrientation(RadioGroup.VERTICAL);
+
+        RadioButton formatA = new RadioButton(this);
+        RadioButton formatB = new RadioButton(this);
+
+        formatA.setText("후보 A · 00 FF 형식");
+        formatB.setText("후보 B · 55 07 형식");
+
+        formatA.setTextColor(fg());
+        formatB.setTextColor(fg());
+
+        formatA.setId(8101);
+        formatB.setId(8102);
+
+        formatGroup.addView(formatA);
+        formatGroup.addView(formatB);
+        parent.addView(formatGroup);
+
+        formatGroup.check(
+            car02Format == 0 ? 8101 : 8102);
+
+        formatGroup.setOnCheckedChangeListener(
+            (group, checkedId) -> {
+                car02Format = checkedId == 8102 ? 1 : 0;
+                updateCar02Preview();
+            });
+
+        section(parent, "구역 선택 바이트");
+
+        parent.addView(text(
+            "기본 후보값: ALL=00, LED1=01, LED2=02\n" +
+            "실제 선택값으로 확인된 값은 아닙니다.",
+            13, muted()));
+
+        car02SelectorInput = new EditText(this);
+        car02SelectorInput.setSingleLine(true);
+        car02SelectorInput.setTextColor(fg());
+
+        car02SelectorInput.setInputType(
+            InputType.TYPE_CLASS_TEXT |
+            InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
+
+        car02SelectorInput.setText(
+            String.format(
+                Locale.US,
+                "%02X", car02Selector & 0xFF));
+
+        car02SelectorInput.setHint("00 ~ FF");
+        parent.addView(car02SelectorInput);
+
+        button(parent, "선택 바이트 적용", () -> {
+            String value = car02SelectorInput
+                .getText().toString().trim();
+
+            if (!value.matches("(?i)[0-9a-f]{2}")) {
+                toast("HEX 두 자리로 입력하세요");
+                return;
+            }
+
+            car02Selector = Integer.parseInt(value, 16);
+            updateCar02Preview();
+        });
+
+        section(parent, "전송할 명령 미리보기");
+
+        car02Preview = text("", 13, fg());
+        car02Preview.setTextIsSelectable(true);
+        car02Preview.setPadding(
+            dp(8), dp(12), dp(8), dp(12));
+        parent.addView(car02Preview);
+
+        button(parent, "CAR02 실험 명령 전송",
+            this::showCar02SendConfirmation);
+
+        button(parent, "기존 RGB 명령으로 복귀", () -> {
+            if (!canSendManualCommand()) return;
+
+            if (modeRunning) {
+                toast("조명 효과를 먼저 중지하세요");
+                return;
+            }
+
+            send(rgbPacket(r, g, b));
+            log("기존 RGB 명령 전송 요청");
+        });
+
+        updateCar02Preview();
     }
 
     private boolean canSendManualCommand() {
@@ -1965,7 +2265,6 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         active = false;
-        // 백그라운드 서비스는 종료하지 않는다.
         disconnect();
         handler.removeCallbacksAndMessages(null);
         super.onDestroy();
@@ -2036,6 +2335,8 @@ public class MainActivity extends Activity {
                         paint);
                 }
             }
+
+            paint.setStyle(Paint.Style.FILL);
         }
     }
 
